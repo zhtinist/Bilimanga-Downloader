@@ -143,37 +143,59 @@ def run_download(config: Config, url_or_no: str) -> None:
 
 def _run_pipeline_with_progress(downloader: Downloader, book: Book, volumes,
                                 temp_dir, out_dir, build_fn):
-    """跑三阶段流水线，显示 下载/扫描 计数器 + 逐卷打包产出。"""
+    """每个选中卷一条进度条：下载→校对→打包→✓完成（逐卷产出）。"""
+    titles = {v.index: v.title for v in volumes}
+
     if _console:
+        from rich.progress import SpinnerColumn
         with Progress(
+            SpinnerColumn(),
             TextColumn("[progress.description]{task.description}"),
             BarColumn(),
             TextColumn("{task.completed}/{task.total}"),
-            TimeRemainingColumn(),
             console=_console,
         ) as progress:
-            task_id = progress.add_task("下载/扫描", total=None)
+            tasks = {v.index: progress.add_task(f"⏳ 等待  {v.title}", total=None,
+                                                start=False) for v in volumes}
 
-            def cb(desc, done, total):
-                progress.update(task_id, description=desc, completed=done,
-                                total=total if total else None)
+            def on_start(vidx):
+                progress.start_task(tasks[vidx])
+                progress.update(tasks[vidx], description=f"⬇ 下载  {titles[vidx]}")
 
-            def packaged(path, vol):
-                progress.console.print(f"  [green]✓ 已产出：{path.name}[/green]")
+            def on_total(vidx, n):
+                progress.update(tasks[vidx], total=max(n, 1))
 
-            return downloader.run_pipeline(book, volumes, temp_dir, out_dir, build_fn,
-                                           progress_cb=cb, on_packaged=packaged)
+            def on_image(vidx):
+                progress.advance(tasks[vidx], 1)
+
+            def on_phase(vidx, phase):
+                label = {"validate": "🔍 校对", "package": "📦 打包"}.get(phase, phase)
+                progress.update(tasks[vidx], description=f"{label}  {titles[vidx]}")
+
+            def on_done(vidx, path):
+                t = tasks[vidx]
+                total = progress.tasks[t].total or 1
+                if path:
+                    progress.update(t, completed=total,
+                                    description=f"[green]✓ 完成  {path.name}[/green]")
+                else:
+                    progress.update(t, completed=total,
+                                    description=f"[yellow]⚠ 无内容  {titles[vidx]}[/yellow]")
+
+            return downloader.run_pipeline(
+                book, volumes, temp_dir, out_dir, build_fn,
+                on_start=on_start, on_total=on_total, on_image=on_image,
+                on_phase=on_phase, on_done=on_done)
     else:
-        def cb(desc, done, total):
-            print(f"\r  {desc} {done}/{total}", end="", flush=True)
+        def on_start(vidx):
+            print(f"⬇ 开始下载 卷{vidx}", flush=True)
 
-        def packaged(path, vol):
-            print(f"\n  ✓ 已产出：{path.name}")
+        def on_done(vidx, path):
+            print(f"✓ 完成 卷{vidx}：{path.name if path else '无内容'}", flush=True)
 
-        out = downloader.run_pipeline(book, volumes, temp_dir, out_dir, build_fn,
-                                      progress_cb=cb, on_packaged=packaged)
-        print()
-        return out
+        return downloader.run_pipeline(
+            book, volumes, temp_dir, out_dir, build_fn,
+            on_start=on_start, on_done=on_done)
 
 
 def _print_help() -> None:

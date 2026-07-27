@@ -275,16 +275,24 @@ class Downloader:
         temp_dir: Path,
         out_dir: Path,
         build_fn: Callable,
-        progress_cb: Optional[Callable[[str, int, int], None]] = None,
-        on_packaged: Optional[Callable] = None,
+        on_start: Optional[Callable] = None,
+        on_total: Optional[Callable] = None,
+        on_image: Optional[Callable] = None,
+        on_phase: Optional[Callable] = None,
+        on_done: Optional[Callable] = None,
     ) -> List[Path]:
-        """下载(网络)→校对(本地)→打包(本地) 三阶段流水线，边下边校边打包。
+        """逐卷串行下载 + 校对/打包后台重叠。每卷一条进度：下载→校对→打包→完成。
 
-        - Agent1(下载)：逐话处理，话内多张图并发；用自适应限流器按网络实时调节全局并发。
-        - Agent2(校对)：本地检查缺失/空文件，不联网；未过则回退给 Agent1 重下(最多 3 次)。
-        - Agent3(打包)：某卷全部话校对完成即打包成 EPUB/PDF 到 out_dir，逐卷产出。
+        - 下载：一次只下一卷（其余等待），卷内多图并发，AIMD 按网络自适应并发。
+        - 下完立即交给后台线程做本地校对(查缺失/空文件，不联网) + 打包，
+          与下一卷的下载重叠进行，逐卷产出 EPUB/PDF。
 
-        build_fn(book, DownloadedVolume, out_dir) -> Path。返回已产出成品路径列表。
+        回调（均可选，参数首位为卷号 vidx）：
+          on_start(vidx)         该卷开始下载
+          on_total(vidx, n)      该卷图片总数已知
+          on_image(vidx)         该卷下载完成一张
+          on_phase(vidx, phase)  阶段变化：'validate' / 'package'
+          on_done(vidx, path)    该卷完成，path 为成品路径（失败为 None）
         """
         base = book.base_url
         book_dir = temp_dir / safe_name(book.title)
@@ -292,41 +300,12 @@ class Downloader:
 
         ceiling = max(2, self.config.parallel_chapters)
         limiter = _Adaptive(start=min(ceiling, 4), lo=2, hi=min(ceiling, 8))
-
-        results: dict = {}
-        vol_dirs: dict = {}
-        chapters_left: dict = {}   # v.index -> 未最终确定的话数
-        for v in volumes:
-            vd = book_dir / safe_name(f"{v.index:02d}_{v.title}")
-            vd.mkdir(parents=True, exist_ok=True)
-            vol_dirs[v.index] = vd
-            results[v.index] = DownloadedVolume(
-                volume=v, dir=vd, cover=None,
-                chapters=[DownloadedChapter(title=c.title) for c in v.chapters])
-            chapters_left[v.index] = len(v.chapters)
-
-        dl_q: "queue.Queue" = queue.Queue()
-        val_q: "queue.Queue" = queue.Queue()
-        pkg_q: "queue.Queue" = queue.Queue()
-        for v in volumes:
-            for ci, ch in enumerate(v.chapters):
-                dl_q.put((v, ci, ch, vol_dirs[v.index], 0))
-
-        scanned = [0]
-        counted: set = set()
-        lock = threading.Lock()
-        outputs: list = []
-        vols_left = [len(volumes)]
-        done_evt = threading.Event()
         img_pool = ThreadPoolExecutor(max_workers=max(2, min(ceiling, 8)))
+        pkg_pool = ThreadPoolExecutor(max_workers=2)  # 后台校对+打包
+        outputs: list = []
+        out_lock = threading.Lock()
 
-        def report():
-            if progress_cb:
-                progress_cb("下载/扫描", len(counted), max(scanned[0], 1))
-
-        report()
-
-        def _dl_image(u, dest, ref):
+        def _fetch(u, dest, ref):
             limiter.acquire()
             ok = False
             try:
@@ -338,128 +317,94 @@ class Downloader:
                 ok = self._valid_jpeg(dest)
             finally:
                 limiter.release(ok)
-            if ok:
-                with lock:
-                    if dest not in counted:
-                        counted.add(dest)
-                        report()
             return ok
 
-        # Agent1：下载
-        def agent1():
-            while True:
-                item = dl_q.get()
-                if item is None:
-                    dl_q.task_done()
-                    return
-                v, ci, ch, vd, attempt = item
+        def _finalize(vidx, dv):
+            # Agent2：本地校对（不联网，查缺失/空文件）
+            if on_phase:
+                on_phase(vidx, "validate")
+            for dc in dv.chapters:
+                dc.images = [p for p in dc.images if self._valid_file(p)]
+                dc.images.sort(key=lambda p: p.name)
+            dv.cover = next((dc.images[0] for dc in dv.chapters if dc.images), None)
+            # Agent3：打包
+            path = None
+            if any(dc.images for dc in dv.chapters):
+                if on_phase:
+                    on_phase(vidx, "package")
+                try:
+                    path = build_fn(book, dv, out_dir)
+                    with out_lock:
+                        outputs.append(path)
+                    import shutil
+                    shutil.rmtree(dv.dir, ignore_errors=True)
+                except Exception as exc:
+                    log.warning("打包卷 %d 失败: %s", vidx, exc)
+            else:
+                log.warning("卷 %d 无图片，跳过打包", vidx)
+            if on_done:
+                on_done(vidx, path)
+
+        pkg_futures = []
+        # Agent1：逐卷串行下载
+        for v in volumes:
+            vd = book_dir / safe_name(f"{v.index:02d}_{v.title}")
+            vd.mkdir(parents=True, exist_ok=True)
+            dv = DownloadedVolume(volume=v, dir=vd, cover=None,
+                                  chapters=[DownloadedChapter(title=c.title) for c in v.chapters])
+            if on_start:
+                on_start(v.index)
+            # 扫描该卷所有话的图片 URL
+            tasks = []  # (url, dest, ref, ci, ii)
+            for ci, ch in enumerate(v.chapters):
                 try:
                     urls = self.scraper.fetch_chapter_images(ch, base)
                 except Exception as exc:
                     log.warning("解析话 %r 失败: %s", ch.title, exc)
                     urls = []
-                dchap = results[v.index].chapters[ci]
-                tasks = []
-                with lock:
-                    first_scan = not dchap.images
-                    dchap.images = [vd / f"{ci:03d}_{ii:04d}.jpg" for ii in range(len(urls))]
-                    if first_scan:
-                        scanned[0] += len(urls)
-                    for ii, u in enumerate(urls):
-                        tasks.append((u, dchap.images[ii], ch.url))
-                # 话内多图并发（受全局限流器节流）
-                futs = [img_pool.submit(_dl_image, u, dd, rf) for (u, dd, rf) in tasks]
+                dchap = dv.chapters[ci]
+                dchap.images = [vd / f"{ci:03d}_{ii:04d}.jpg" for ii in range(len(urls))]
+                for ii, u in enumerate(urls):
+                    tasks.append((u, dchap.images[ii], ch.url))
+            if on_total:
+                on_total(v.index, len(tasks))
+
+            # 卷内多图并发下载（受 AIMD 限流器节流）
+            done_cnt = [0]
+            dlock = threading.Lock()
+
+            def _one(t):
+                ok = _fetch(t[0], t[1], t[2])
+                if ok and on_image:
+                    on_image(v.index)
+                return t, ok
+
+            pending = list(tasks)
+            for _round in range(4):
+                if not pending:
+                    break
+                futs = [img_pool.submit(_one, t) for t in pending]
                 for f in futs:
                     try:
                         f.result()
                     except Exception:
                         pass
-                report()
-                val_q.put((v, ci, tasks, attempt))
-                dl_q.task_done()
+                pending = [t for t in tasks if not self._valid_file(t[1])]
+                if pending:
+                    time.sleep(1.0)  # 退避后重试缺失
 
-        # Agent2：本地校对（查漏/空文件，不联网）
-        def agent2():
-            while True:
-                item = val_q.get()
-                if item is None:
-                    val_q.task_done()
-                    return
-                v, ci, tasks, attempt = item
-                missing = [t for t in tasks if not self._valid_file(t[1])]
-                if missing and attempt < 3:
-                    log.info("校对：话 %d-%d 缺 %d 张，回退重下(第%d次)",
-                             v.index, ci, len(missing), attempt + 1)
-                    dl_q.put((v, ci, v.chapters[ci], vol_dirs[v.index], attempt + 1))
-                    val_q.task_done()
-                    continue
-                if missing:
-                    log.warning("话 %d-%d 仍缺 %d 张，尽力打包", v.index, ci, len(missing))
-                # 该话最终确定
-                fire_pkg = None
-                with lock:
-                    chapters_left[v.index] -= 1
-                    if chapters_left[v.index] == 0:
-                        fire_pkg = v.index
-                if fire_pkg is not None:
-                    pkg_q.put(fire_pkg)
-                val_q.task_done()
+            # 下完 → 交后台校对+打包（与下一卷下载重叠）
+            pkg_futures.append(pkg_pool.submit(_finalize, v.index, dv))
 
-        # Agent3：打包（本地 CPU）
-        def agent3():
-            while True:
-                vidx = pkg_q.get()
-                if vidx is None:
-                    pkg_q.task_done()
-                    return
-                dv = results[vidx]
-                # 组装：过滤有效 + 按页序 + 每卷封面=第一张图
-                for dc in dv.chapters:
-                    imgs = [p for p in dc.images if self._valid_file(p)]
-                    imgs.sort(key=lambda p: p.name)
-                    dc.images = imgs
-                dv.cover = next((dc.images[0] for dc in dv.chapters if dc.images), None)
-                if any(dc.images for dc in dv.chapters):
-                    try:
-                        out = build_fn(book, dv, out_dir)
-                        with lock:
-                            outputs.append(out)
-                        if on_packaged:
-                            on_packaged(out, dv.volume)
-                        # 打包成功后清理该卷临时图
-                        import shutil
-                        shutil.rmtree(dv.dir, ignore_errors=True)
-                    except Exception as exc:
-                        log.warning("打包卷 %d 失败: %s", vidx, exc)
-                else:
-                    log.warning("卷 %d 无图片，跳过打包", vidx)
-                with lock:
-                    vols_left[0] -= 1
-                    if vols_left[0] <= 0:
-                        done_evt.set()
-                pkg_q.task_done()
-
-        n1 = max(1, min(ceiling, 3))
-        n2, n3 = 2, 2
-        threads = []
-        for fn, cnt in ((agent1, n1), (agent2, n2), (agent3, n3)):
-            for _ in range(cnt):
-                th = threading.Thread(target=fn, daemon=True)
-                th.start()
-                threads.append(th)
-
-        done_evt.wait()
-        # 收尾：给各 agent 发停止信号
-        for _ in range(n1):
-            dl_q.put(None)
-        for _ in range(n2):
-            val_q.put(None)
-        for _ in range(n3):
-            pkg_q.put(None)
-        for th in threads:
-            th.join(timeout=10)
+        for f in pkg_futures:
+            try:
+                f.result()
+            except Exception:
+                pass
         img_pool.shutdown(wait=False)
+        pkg_pool.shutdown(wait=True)
         return outputs
+
 
     @staticmethod
     def _valid_file(path: Path) -> bool:
