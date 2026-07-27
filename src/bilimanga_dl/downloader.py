@@ -149,73 +149,52 @@ class Downloader:
         total = len(img_tasks)
         log.info("待下载 %d 话 / %d 张图片，并发 %d", len(jobs), total, par)
 
-        # 阶段 2：多标签并行 × 同源批量并发 fetch（模拟看漫画的原生并发，快）
+        # 阶段 2：多标签并行、逐张下载（稳定的同步 XHR，跨 DrissionPage 版本都可靠）
         done = 0
         lock = threading.Lock()
-        CHUNK = 6  # 每次 Promise.all 并发张数（浏览器每域约 6 连接）
 
-        # 断点续传：已存在的先计入进度，不重复下
-        pending = []
-        for t in img_tasks:
-            if self.config.resume_enabled and self._valid_jpeg(t[1]):
-                done += 1
-            else:
-                pending.append(t)
-        if progress_cb:
-            progress_cb("下载图片", done, total)
+        def dl(task):
+            u, dest, ref = task
+            self._download_one(u, dest, ref)  # 内含断点续传
 
-        chunks = [pending[i:i + CHUNK] for i in range(0, len(pending), CHUNK)]
+        with ThreadPoolExecutor(max_workers=par) as pool:
+            futs = {pool.submit(dl, t): t for t in img_tasks}
+            for fut in as_completed(futs):
+                try:
+                    fut.result()
+                except Exception as exc:
+                    log.warning("图片下载失败 %s: %s", futs[fut][1].name, exc)
+                with lock:
+                    done += 1
+                    cur = done
+                if progress_cb:
+                    progress_cb("下载图片", cur, total)
 
-        def do_chunk(chunk):
-            nonlocal done
-            urls = [t[0] for t in chunk]
-            try:
-                datas = self.net.get_images_batch(urls)
-            except Exception as exc:
-                log.warning("批量下载异常: %s", exc)
-                datas = [None] * len(chunk)
-            for (u, dest, ref), data in zip(chunk, datas):
-                if data:
-                    try:
-                        save_as_jpeg(data, dest)
-                    except Exception as exc:
-                        log.warning("保存失败 %s: %s", dest.name, exc)
-            with lock:
-                done += len(chunk)
-                cur = done
-            if progress_cb:
-                progress_cb("下载图片", cur, total)
-
-        if chunks:
-            with ThreadPoolExecutor(max_workers=par) as pool:
-                list(pool.map(do_chunk, chunks))
-
-        # 静默补漏：首轮并发可能因速率质询掉几张，这里【不展示进度、自动完成】。
-        # 用批量抓取快速补齐，用户视角进度条已到 100%，随后直接进入打包。
+        # 补漏：对首轮未下到的图重试，【单独显示进度条】，避免看起来卡住。轮数由配置控制。
         def _missing():
             return [t for t in img_tasks if not self._valid_jpeg(t[1])]
 
-        def _redl_chunk(chunk):
-            urls = [t[0] for t in chunk]
+        def _redl(task):
             try:
-                datas = self.net.get_images_batch(urls)
+                self._download_one(*task)
             except Exception:
-                datas = [None] * len(chunk)
-            for (u, dest, ref), data in zip(chunk, datas):
-                if data:
-                    try:
-                        save_as_jpeg(data, dest)
-                    except Exception:
-                        pass
+                pass
 
         for _round in range(max(0, self.config.retry_missing_rounds)):
             left = _missing()
             if not left:
                 break
-            log.info("静默补漏第 %d 轮：%d 张（不展示进度）", _round + 1, len(left))
-            chs = [left[i:i + CHUNK] for i in range(0, len(left), CHUNK)]
+            log.info("补漏第 %d 轮：%d 张", _round + 1, len(left))
+            rtotal = len(left)
+            rdone = 0
+            desc = f"补齐缺失(第{_round + 1}轮)"
+            if progress_cb:
+                progress_cb(desc, 0, rtotal)
             with ThreadPoolExecutor(max_workers=par) as pool:
-                list(pool.map(_redl_chunk, chs))
+                for _f in as_completed([pool.submit(_redl, t) for t in left]):
+                    rdone += 1
+                    if progress_cb:
+                        progress_cb(desc, rdone, rtotal)
 
         still = _missing()
         if still:

@@ -144,26 +144,6 @@ try {
 } catch (e) { return 'ERR:' + e; }
 """
 
-# 同源批量抓取：一次 Promise.all 并发 fetch 多张图（模拟浏览器看漫画的原生并发），
-# 返回与输入顺序对应的 base64 列表（失败项为 "ERR:..."）。
-_BATCH_FETCH_JS = r"""
-const urls = arguments[0];
-return (async () => {
-  const out = new Array(urls.length).fill(null);
-  await Promise.all(urls.map(async (u, i) => {
-    try {
-      const r = await fetch(u, {credentials: 'include'});
-      if (!r.ok) { out[i] = 'ERR:' + r.status; return; }
-      const buf = await r.arrayBuffer();
-      const a = new Uint8Array(buf); let s = '';
-      const CH = 0x8000;
-      for (let j = 0; j < a.length; j += CH) s += String.fromCharCode.apply(null, a.subarray(j, j + CH));
-      out[i] = btoa(s);
-    } catch (e) { out[i] = 'ERR:' + String(e); }
-  }));
-  return out;
-})();
-"""
 
 
 class BrowserEngine:
@@ -315,41 +295,6 @@ class BrowserEngine:
         finally:
             self._release(tab)
 
-    def get_images_batch(self, urls):
-        """同源批量抓取（一次 Promise.all 并发多张）。返回 List[Optional[bytes]]，
-        与输入顺序对应，失败项为 None。urls 必须同源。"""
-        if not urls:
-            return []
-        tab = self._borrow()
-        try:
-            target_origin = self._origin(urls[0])
-            # 确保标签在该源上（一次导航即可，之后同源 fetch）
-            for attempt in range(3):
-                try:
-                    if self._origin(tab.url or "") != target_origin:
-                        tab.get(urls[0])
-                        deadline = time.time() + min(self.config.cloudflare_wait, 20)
-                        while _html_state(tab.html or "") == "challenge" and time.time() < deadline:
-                            time.sleep(1.0)
-                    res = tab.run_js(_BATCH_FETCH_JS, list(urls))
-                    if isinstance(res, list):
-                        out = []
-                        for x in res:
-                            if isinstance(x, str) and not x.startswith("ERR"):
-                                try:
-                                    out.append(base64.b64decode(x))
-                                except Exception:
-                                    out.append(None)
-                            else:
-                                out.append(None)
-                        return out
-                except Exception as exc:
-                    log.debug("批量抓取异常(重试): %s", exc)
-                time.sleep(1.0 + attempt)
-            return [None] * len(urls)
-        finally:
-            self._release(tab)
-
     def close(self):
         with self._lock:
             try:
@@ -489,18 +434,6 @@ class Net:
             return self.browser.get_image_bytes(url)
         resp = self._requests_fetch(url, referer=referer, stream=True)
         return resp.content
-
-    def get_images_batch(self, urls):
-        """批量抓取图片字节，返回 List[Optional[bytes]] 与 urls 对应。"""
-        if self.browser:
-            return self.browser.get_images_batch(urls)
-        out = []
-        for u in urls:
-            try:
-                out.append(self._requests_fetch(u, stream=True).content)
-            except Exception:
-                out.append(None)
-        return out
 
     def close(self) -> None:
         try:

@@ -139,6 +139,12 @@ def run_download(config: Config, url_or_no: str) -> None:
             _print(f"  [red]打包失败（{dv.volume.title}）：{exc}[/red]")
 
     net.close()
+
+    # 全部成功则清理该书的临时图片目录（部分失败则保留，便于下次续传）
+    if outputs and len(outputs) == len(volumes):
+        import shutil
+        shutil.rmtree(TEMP_DOWNLOAD_DIR / safe_name(book.title), ignore_errors=True)
+
     _print(f"\n[bold green]全部完成，共 {len(outputs)} 个文件 → {target}[/bold green]")
 
 
