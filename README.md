@@ -1,5 +1,7 @@
 # Bilimanga-Downloader
 
+[English](README.en.md) · **中文**
+
 [bilimanga.net](https://www.bilimanga.net/) 漫画下载器。跨平台（macOS / Windows）纯 Python 实现：
 用真实浏览器过 Cloudflare 抓取漫画插图，按卷/话下载并打包为 **EPUB** 或 **PDF**。
 
