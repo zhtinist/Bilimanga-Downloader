@@ -142,24 +142,32 @@ for (var i = 0; i < g.length; i++) {
 return [g.length, loaded, urls];
 """
 
-# 同源批量抓取：一次 Promise.all 并发 fetch 多张图。用 force-cache 优先读浏览器缓存
-# （页面已原生加载过这些图），命中则不触发网络请求、不会 429。run_js 不支持 list，
-# 故用 JSON 字符串传参；标签须已在图片同源上。
-_BATCH_JS = r"""
+# 同源限流并发抓取：LIMIT 个 worker 从共享队列取 URL 并发 fetch（模仿浏览器 <img>
+# 的 ~6 并发节流，避免一次性 burst 触发 429），一次 run_js 抓完一整话。
+# run_js 不支持 list，故用 JSON 字符串传参；标签须已在图片同源上。
+_POOL_JS = r"""
 const urls = JSON.parse(arguments[0]);
+const LIMIT = 5, TIMEOUT = 15000;
 return (async () => {
   const out = new Array(urls.length).fill(null);
-  await Promise.all(urls.map(async (u, i) => {
+  let idx = 0;
+  async function one(u) {
+    const c = new AbortController();
+    const t = setTimeout(() => c.abort(), TIMEOUT);
     try {
-      const r = await fetch(u, {credentials: 'include', cache: 'force-cache'});
-      if (!r.ok) { out[i] = 'ERR' + r.status; return; }
+      const r = await fetch(u, {credentials: 'include', signal: c.signal});
+      if (!r.ok) return 'ERR' + r.status;
       const b = await r.arrayBuffer();
       const a = new Uint8Array(b);
       let s = ''; const C = 0x8000;
       for (let j = 0; j < a.length; j += C) s += String.fromCharCode.apply(null, a.subarray(j, j + C));
-      out[i] = btoa(s);
-    } catch (e) { out[i] = 'ERR:' + e; }
-  }));
+      return btoa(s);
+    } catch (e) { return 'ERR:' + e; } finally { clearTimeout(t); }
+  }
+  async function worker() {
+    while (idx < urls.length) { const i = idx++; out[i] = await one(urls[i]); }
+  }
+  await Promise.all(Array.from({length: LIMIT}, worker));
   return out;
 })();
 """
@@ -221,6 +229,10 @@ class BrowserEngine:
             co.headless(True)
         co.set_argument("--no-first-run")
         co.set_argument("--no-default-browser-check")
+        # 仅在显式配置 proxy 时才设代理；否则用默认（实测最快，不要加 --no-proxy-server）。
+        if self.config.proxy:
+            co.set_proxy(self.config.proxy)
+            log.info("浏览器走代理: %s", self.config.proxy)
         co.set_argument("--disk-cache-size=1073741824")  # 1GB 磁盘缓存，利于 force-cache 命中
         # 站点/图片流量优先走代理（配置优先，其次系统环境变量）
         proxy = self.config.proxy or os.environ.get("https_proxy") or \
@@ -361,28 +373,26 @@ class BrowserEngine:
 
     def download_chapter(self, chapter_url, dest_dir, prefix, resume=True,
                          on_scanned=None, on_saved=None):
-        """在一个标签上完成一话的下载（模拟看漫画 + 落盘），返回已保存 jpg 路径列表。
+        """在一个标签上完成一话的下载，返回已保存 jpg 路径列表。
 
-        流程：①导航阅读页 + 滚动触发浏览器**原生并发加载**所有图（快、不 429）；
-        ②读取有序 data-src；③导航到图片同源，用 force-cache 批量读缓存（多数命中，秒取）；
-        ④少数未命中用逐张同步 XHR 兜底（可靠）。
+        ①加载阅读页拿到有序 data-src（不滚动、不触发原生加载，避免双重下载）；
+        ②导航到图片同源；③限流 5 并发 fetch 一次抓完整话（模仿浏览器节流，避 429）；
+        ④少数失败用同步 XHR 兜底。
         """
         tab = self._borrow()
         saved = []
         try:
-            # ① 加载阅读页并过 Cloudflare
+            # ① 加载阅读页并过 Cloudflare，等 data-src 出现
             tab.get(chapter_url)
-            dl = time.time() + self.config.cloudflare_wait
-            while _html_state(tab.html or "") == "challenge" and time.time() < dl:
-                time.sleep(1.0)
-            # 滚动触发懒加载，直到全部 complete（或超时）
-            deadline = time.time() + max(25, self.config.cloudflare_wait)
+            deadline = time.time() + self.config.cloudflare_wait
             n, loaded, urls = tab.run_js(_SCAN_JS)
             while time.time() < deadline:
-                if n > 0 and loaded >= n:
+                st = _html_state(tab.html or "")
+                if st == "blocked":
+                    raise CloudflareBlocked(f"该 IP 被 Cloudflare 硬封禁: {chapter_url}")
+                if st != "challenge" and n > 0:
                     break
-                tab.scroll.down(4000)
-                time.sleep(0.25)
+                time.sleep(0.8)
                 n, loaded, urls = tab.run_js(_SCAN_JS)
             urls = [u for u in (urls or []) if u]
             if on_scanned:
@@ -399,13 +409,13 @@ class BrowserEngine:
                 if resume and self._valid_file(dd):
                     saved.append(dd)
                     if on_saved:
-                        on_saved()
+                        on_saved(dd)
                 else:
                     need.append((u, dd))
             if not need:
                 return saved
 
-            # ③ 导航到图片同源，force-cache 批量读缓存
+            # ② 导航到图片同源
             origin = self._origin(need[0][0])
             try:
                 if self._origin(tab.url or "") != origin:
@@ -414,27 +424,29 @@ class BrowserEngine:
             except Exception:
                 pass
 
+            # ③ 限流并发抓取：分小组多次 run_js（单次别太长，避免 run_js 超时）
             still = []
-            for i in range(0, len(need), 12):
-                chunk = need[i:i + 12]
+            GROUP = 8
+            for gi in range(0, len(need), GROUP):
+                grp = need[gi:gi + GROUP]
                 try:
-                    res = tab.run_js(_BATCH_JS, json.dumps([u for u, _ in chunk]))
+                    res = tab.run_js(_POOL_JS, json.dumps([u for u, _ in grp]))
                 except Exception:
                     res = None
                 if isinstance(res, list):
-                    for (u, dd), x in zip(chunk, res):
+                    for (u, dd), x in zip(grp, res):
                         if isinstance(x, str) and not x.startswith("ERR"):
                             try:
                                 save_as_jpeg(base64.b64decode(x), dd)
                                 saved.append(dd)
                                 if on_saved:
-                                    on_saved()
+                                    on_saved(dd)
                                 continue
                             except Exception:
                                 pass
                         still.append((u, dd))
                 else:
-                    still.extend(chunk)
+                    still.extend(grp)
 
             # ④ 未命中的逐张同步 XHR 兜底（可靠，轻量重试）
             for u, dd in still:
@@ -448,7 +460,7 @@ class BrowserEngine:
                             save_as_jpeg(base64.b64decode(r), dd)
                             saved.append(dd)
                             if on_saved:
-                                on_saved()
+                                on_saved(dd)
                         except Exception:
                             pass
                         break

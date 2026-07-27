@@ -114,16 +114,30 @@ class Downloader:
 
         ceiling = max(2, self.config.parallel_chapters)
         scanned = [0]
-        downloaded = [0]
+        counted: set = set()
+        scanned_by_job: dict = {}
         lock = threading.Lock()
 
         def report():
             if progress_cb:
-                progress_cb("下载/扫描", downloaded[0], max(scanned[0], 1))
+                progress_cb("下载/扫描", len(counted), max(scanned[0], 1))
+
+        def _mark_saved(dest):
+            with lock:
+                if dest not in counted and self._valid_jpeg(dest):
+                    counted.add(dest)
+                    report()
+
+        def _set_scanned(jobkey, k):
+            with lock:
+                scanned_by_job[jobkey] = k
+                scanned[0] = sum(scanned_by_job.values())
+                report()
 
         report()
 
-        # 阶段 1：并行扫描每话图片 URL（wait_for imagecontent，可靠）
+        # 阶段 1：并行扫描每话 URL（wait_for imagecontent，可靠）
+        img_tasks: list = []
         def scan_one(job):
             v, ci, ch, vd = job
             try:
@@ -132,27 +146,25 @@ class Downloader:
                 log.warning("解析话 %r 失败: %s", ch.title, exc)
                 urls = []
             dchap = results[v.index].chapters[ci]
+            local = []
+            for ii, u in enumerate(urls):
+                dest = vd / f"{ci:03d}_{ii:04d}.jpg"
+                dchap.images.append(dest)
+                local.append((u, dest, ch.url))
             with lock:
-                for ii, u in enumerate(urls):
-                    dest = vd / f"{ci:03d}_{ii:04d}.jpg"
-                    dchap.images.append(dest)
-                    img_tasks.append((u, dest, ch.url))
-                scanned[0] += len(urls)
-                report()
+                img_tasks.extend(local)
+            _set_scanned((v.index, ci), len(urls))
 
-        img_tasks: list = []  # (url, dest, referer)
         with ThreadPoolExecutor(max_workers=min(ceiling, 3)) as pool:
             list(pool.map(scan_one, jobs))
 
-        # 已存在的（断点续传）先计入
+        # 断点续传：已存在的先计入
         pending = deque()
         for t in img_tasks:
             if self.config.resume_enabled and self._valid_jpeg(t[1]):
-                with lock:
-                    downloaded[0] += 1
+                _mark_saved(t[1])
             else:
                 pending.append(t)
-        report()
 
         def _do(task):
             u, dest, ref = task
@@ -162,7 +174,8 @@ class Downloader:
             except Exception:
                 return task, False
 
-        # 阶段 2：自适应并发(AIMD) 逐张下载。起步≈缺口 10%，一波无错 +5%，出错 -3% + 退避
+        # 阶段 2：AIMD 自适应并发逐张下载（同步 XHR，可靠）。
+        # 起步≈缺口 10%，一波无错 +5%，出错(429/失败) -3% 并退避。
         n = len(pending)
         if n:
             limit = min(ceiling, max(2, math.ceil(n * 0.10)))
@@ -177,39 +190,31 @@ class Downloader:
                     for fut in as_completed([pool.submit(_do, t) for t in wave]):
                         task, ok = fut.result()
                         if ok:
-                            with lock:
-                                downloaded[0] += 1
+                            _mark_saved(task[1])
                         else:
                             errors += 1
                             attempts[task[1]] = attempts.get(task[1], 0) + 1
                             if attempts[task[1]] < MAX_ATTEMPTS:
                                 pending.append(task)
-                        report()
                 if errors == 0:
                     limit = min(ceiling, limit + step_up)
                 else:
                     limit = max(2, limit - step_down)
                     time.sleep(min(5.0, 0.5 + errors * 0.3))
 
-        # 最终补齐：仍缺失的**单线程、多次重试、渐进退避**稳妥补下，尽最大努力保证完整
+        # 最终补齐：仍缺失的单线程多次重试，尽力保证完整
         for _sweep in range(2):
             leftover = [t for t in img_tasks if not self._valid_jpeg(t[1])]
             if not leftover:
                 break
-            log.info("最终补齐第 %d 轮：%d 张（单线程稳妥）", _sweep + 1, len(leftover))
+            log.info("最终补齐第 %d 轮：%d 张", _sweep + 1, len(leftover))
             for task in leftover:
                 for k in range(5):
                     _, ok = _do(task)
                     if ok:
-                        with lock:
-                            downloaded[0] += 1
-                        report()
+                        _mark_saved(task[1])
                         break
-                    time.sleep(1.5 + k)  # 渐进退避，等 429 冷却
-        still = [t for t in img_tasks if not self._valid_jpeg(t[1])]
-        if still:
-            log.warning("仍有 %d 张无法下载(疑似源站失效)：%s",
-                        len(still), [t[0] for t in still[:5]])
+                    time.sleep(1.0 + k)
 
         # 过滤缺失/损坏并按页序排序；每卷封面 = 该卷第一张图
         for dv in results.values():
