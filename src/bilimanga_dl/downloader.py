@@ -149,26 +149,46 @@ class Downloader:
         total = len(img_tasks)
         log.info("待下载 %d 话 / %d 张图片，并发 %d", len(jobs), total, par)
 
-        # 阶段 2：扁平并行下载全部图片
+        # 阶段 2：多标签并行 × 同源批量并发 fetch（模拟看漫画的原生并发，快）
         done = 0
         lock = threading.Lock()
+        CHUNK = 6  # 每次 Promise.all 并发张数（浏览器每域约 6 连接）
 
-        def dl(task):
-            u, dest, ref = task
-            return self._download_one(u, dest, ref)
+        # 断点续传：已存在的先计入进度，不重复下
+        pending = []
+        for t in img_tasks:
+            if self.config.resume_enabled and self._valid_jpeg(t[1]):
+                done += 1
+            else:
+                pending.append(t)
+        if progress_cb:
+            progress_cb("下载图片", done, total)
 
-        with ThreadPoolExecutor(max_workers=par) as pool:
-            futs = {pool.submit(dl, t): t for t in img_tasks}
-            for fut in as_completed(futs):
-                try:
-                    fut.result()
-                except Exception as exc:
-                    log.warning("图片下载失败 %s: %s", futs[fut][1].name, exc)
-                with lock:
-                    done += 1
-                    cur = done
-                if progress_cb:
-                    progress_cb("下载图片", cur, total)
+        chunks = [pending[i:i + CHUNK] for i in range(0, len(pending), CHUNK)]
+
+        def do_chunk(chunk):
+            nonlocal done
+            urls = [t[0] for t in chunk]
+            try:
+                datas = self.net.get_images_batch(urls)
+            except Exception as exc:
+                log.warning("批量下载异常: %s", exc)
+                datas = [None] * len(chunk)
+            for (u, dest, ref), data in zip(chunk, datas):
+                if data:
+                    try:
+                        save_as_jpeg(data, dest)
+                    except Exception as exc:
+                        log.warning("保存失败 %s: %s", dest.name, exc)
+            with lock:
+                done += len(chunk)
+                cur = done
+            if progress_cb:
+                progress_cb("下载图片", cur, total)
+
+        if chunks:
+            with ThreadPoolExecutor(max_workers=par) as pool:
+                list(pool.map(do_chunk, chunks))
 
         # 补漏：并行首轮可能因速率质询掉几张，对仍缺失的再补下几轮直到齐
         def _missing():
