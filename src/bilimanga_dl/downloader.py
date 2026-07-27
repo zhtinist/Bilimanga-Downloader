@@ -12,8 +12,12 @@
 
 from __future__ import annotations
 
+import math
+import queue
 import re
 import threading
+import time
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -80,19 +84,6 @@ class Downloader:
         log.debug("已保存: %s (%d bytes)", dest.name, len(data))
         return dest
 
-    def _download_cover(self, book: Book, book_dir: Path) -> Optional[Path]:
-        if not book.cover_url:
-            return None
-        cover_path = book_dir / "cover.jpg"
-        try:
-            if not (self.config.resume_enabled and self._valid_jpeg(cover_path)):
-                data = self.net.get_bytes(book.cover_url, referer=book.base_url)
-                save_as_jpeg(data, cover_path)
-            return cover_path
-        except Exception as exc:
-            log.warning("封面下载失败: %s", exc)
-            return None
-
     def download_selected(
         self,
         book: Book,
@@ -107,103 +98,126 @@ class Downloader:
         base = book.base_url
         book_dir = work_dir / safe_name(book.title)
         book_dir.mkdir(parents=True, exist_ok=True)
-        cover_path = self._download_cover(book, book_dir)
 
-        # 建结果骨架 + 话任务清单
+        # 建结果骨架 + 话任务清单（封面改为“每卷第一张图”，下载后再设置）
         results: dict = {}
         jobs = []  # (volume, chap_idx, chapter, vol_dir)
         for v in volumes:
             vol_dir = book_dir / safe_name(f"{v.index:02d}_{v.title}")
             vol_dir.mkdir(parents=True, exist_ok=True)
             results[v.index] = DownloadedVolume(
-                volume=v, dir=vol_dir, cover=cover_path,
+                volume=v, dir=vol_dir, cover=None,
                 chapters=[DownloadedChapter(title=c.title) for c in v.chapters],
             )
             for ci, ch in enumerate(v.chapters):
                 jobs.append((v, ci, ch, vol_dir))
 
-        par = max(1, self.config.parallel_chapters)
-
-        # 阶段 1：并行解析每话的图片 URL
-        def fetch_urls(job):
-            v, ci, ch, _vd = job
-            try:
-                return (v.index, ci), self.scraper.fetch_chapter_images(ch, base)
-            except Exception as exc:
-                log.warning("解析话 %r 图片失败: %s", ch.title, exc)
-                return (v.index, ci), []
-
-        url_map: dict = {}
-        with ThreadPoolExecutor(max_workers=par) as pool:
-            for key, urls in pool.map(fetch_urls, jobs):
-                url_map[key] = urls
-
-        # 组织图片下载任务（扁平）
-        img_tasks = []  # (url, dest, referer)
-        for (v, ci, ch, vd) in jobs:
-            dchap = results[v.index].chapters[ci]
-            for ii, u in enumerate(url_map[(v.index, ci)]):
-                dest = vd / f"{ci:03d}_{ii:04d}.jpg"
-                dchap.images.append(dest)
-                img_tasks.append((u, dest, ch.url))
-        total = len(img_tasks)
-        log.info("待下载 %d 话 / %d 张图片，并发 %d", len(jobs), total, par)
-
-        # 阶段 2：多标签并行、逐张下载（稳定的同步 XHR，跨 DrissionPage 版本都可靠）
-        done = 0
+        ceiling = max(2, self.config.parallel_chapters)
+        scanned = [0]
+        downloaded = [0]
         lock = threading.Lock()
 
-        def dl(task):
-            u, dest, ref = task
-            self._download_one(u, dest, ref)  # 内含断点续传
-
-        with ThreadPoolExecutor(max_workers=par) as pool:
-            futs = {pool.submit(dl, t): t for t in img_tasks}
-            for fut in as_completed(futs):
-                try:
-                    fut.result()
-                except Exception as exc:
-                    log.warning("图片下载失败 %s: %s", futs[fut][1].name, exc)
-                with lock:
-                    done += 1
-                    cur = done
-                if progress_cb:
-                    progress_cb("下载图片", cur, total)
-
-        # 补漏：对首轮未下到的图重试，【单独显示进度条】，避免看起来卡住。轮数由配置控制。
-        def _missing():
-            return [t for t in img_tasks if not self._valid_jpeg(t[1])]
-
-        def _redl(task):
-            try:
-                self._download_one(*task)
-            except Exception:
-                pass
-
-        for _round in range(max(0, self.config.retry_missing_rounds)):
-            left = _missing()
-            if not left:
-                break
-            log.info("补漏第 %d 轮：%d 张", _round + 1, len(left))
-            rtotal = len(left)
-            rdone = 0
-            desc = f"补齐缺失(第{_round + 1}轮)"
+        def report():
             if progress_cb:
-                progress_cb(desc, 0, rtotal)
-            with ThreadPoolExecutor(max_workers=par) as pool:
-                for _f in as_completed([pool.submit(_redl, t) for t in left]):
-                    rdone += 1
-                    if progress_cb:
-                        progress_cb(desc, rdone, rtotal)
+                progress_cb("下载/扫描", downloaded[0], max(scanned[0], 1))
 
-        still = _missing()
+        report()
+
+        # 阶段 1：并行扫描每话图片 URL（wait_for imagecontent，可靠）
+        def scan_one(job):
+            v, ci, ch, vd = job
+            try:
+                urls = self.scraper.fetch_chapter_images(ch, base)
+            except Exception as exc:
+                log.warning("解析话 %r 失败: %s", ch.title, exc)
+                urls = []
+            dchap = results[v.index].chapters[ci]
+            with lock:
+                for ii, u in enumerate(urls):
+                    dest = vd / f"{ci:03d}_{ii:04d}.jpg"
+                    dchap.images.append(dest)
+                    img_tasks.append((u, dest, ch.url))
+                scanned[0] += len(urls)
+                report()
+
+        img_tasks: list = []  # (url, dest, referer)
+        with ThreadPoolExecutor(max_workers=min(ceiling, 3)) as pool:
+            list(pool.map(scan_one, jobs))
+
+        # 已存在的（断点续传）先计入
+        pending = deque()
+        for t in img_tasks:
+            if self.config.resume_enabled and self._valid_jpeg(t[1]):
+                with lock:
+                    downloaded[0] += 1
+            else:
+                pending.append(t)
+        report()
+
+        def _do(task):
+            u, dest, ref = task
+            try:
+                self._download_one(u, dest, ref)
+                return task, self._valid_jpeg(dest)
+            except Exception:
+                return task, False
+
+        # 阶段 2：自适应并发(AIMD) 逐张下载。起步≈缺口 10%，一波无错 +5%，出错 -3% + 退避
+        n = len(pending)
+        if n:
+            limit = min(ceiling, max(2, math.ceil(n * 0.10)))
+            step_up = max(1, round(n * 0.05))
+            step_down = max(1, round(n * 0.03))
+            MAX_ATTEMPTS = 4
+            attempts: dict = {}
+            while pending:
+                wave = [pending.popleft() for _ in range(min(limit, len(pending)))]
+                errors = 0
+                with ThreadPoolExecutor(max_workers=len(wave)) as pool:
+                    for fut in as_completed([pool.submit(_do, t) for t in wave]):
+                        task, ok = fut.result()
+                        if ok:
+                            with lock:
+                                downloaded[0] += 1
+                        else:
+                            errors += 1
+                            attempts[task[1]] = attempts.get(task[1], 0) + 1
+                            if attempts[task[1]] < MAX_ATTEMPTS:
+                                pending.append(task)
+                        report()
+                if errors == 0:
+                    limit = min(ceiling, limit + step_up)
+                else:
+                    limit = max(2, limit - step_down)
+                    time.sleep(min(5.0, 0.5 + errors * 0.3))
+
+        # 最终补齐：仍缺失的**单线程、多次重试、渐进退避**稳妥补下，尽最大努力保证完整
+        for _sweep in range(2):
+            leftover = [t for t in img_tasks if not self._valid_jpeg(t[1])]
+            if not leftover:
+                break
+            log.info("最终补齐第 %d 轮：%d 张（单线程稳妥）", _sweep + 1, len(leftover))
+            for task in leftover:
+                for k in range(5):
+                    _, ok = _do(task)
+                    if ok:
+                        with lock:
+                            downloaded[0] += 1
+                        report()
+                        break
+                    time.sleep(1.5 + k)  # 渐进退避，等 429 冷却
+        still = [t for t in img_tasks if not self._valid_jpeg(t[1])]
         if still:
-            log.warning("仍有 %d 张图片未下到", len(still))
+            log.warning("仍有 %d 张无法下载(疑似源站失效)：%s",
+                        len(still), [t[0] for t in still[:5]])
 
-        # 过滤缺失/损坏，保持顺序
+        # 过滤缺失/损坏并按页序排序；每卷封面 = 该卷第一张图
         for dv in results.values():
             for dchap in dv.chapters:
-                dchap.images = [p for p in dchap.images if self._valid_jpeg(p)]
+                imgs = [p for p in dchap.images if self._valid_jpeg(p)]
+                imgs.sort(key=lambda p: p.name)
+                dchap.images = imgs
+            dv.cover = next((dc.images[0] for dc in dv.chapters if dc.images), None)
         return [results[v.index] for v in volumes]
 
     def download_volume(

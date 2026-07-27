@@ -41,7 +41,7 @@ class Config:
 
     # 网络
     mirrors: List[str] = field(default_factory=lambda: list(DEFAULT_MIRRORS))
-    parallel_chapters: int = 8   # 并发数：同时下载的话数 / 浏览器标签数（可调到 16 更快，视代理带宽）
+    parallel_chapters: int = 12  # 并发上限（自适应 AIMD 从低起步，最多爬到这个值）
     request_timeout: int = 30
 
     # 优化开关（3：限速 / 退避重试，二者独立，可同时开启）

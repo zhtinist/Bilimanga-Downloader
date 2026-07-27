@@ -164,16 +164,25 @@ class Scraper:
         return volumes
 
     def fetch_chapter_images(self, chapter: Chapter, base: str) -> List[str]:
-        """返回一话中所有插图的真实 URL（顺序即阅读顺序）。"""
-        html = self.net.get_text(chapter.url, referer=base)
-        soup = _soup(html)
-        urls: List[str] = []
-        for img in soup.find_all("img", class_="imagecontent"):
-            src = img.get("data-src") or img.get("src")
-            if src and not src.startswith("data:"):
-                urls.append(self._abs(src, base))
-        log.debug("话 %r 解析到 %d 张图片", chapter.title, len(urls))
-        return urls
+        """返回一话中所有插图的真实 URL（顺序即阅读顺序）。
+
+        阅读页图片由 JS 懒加载注入，读太早会拿到 0 张，故等待 ``imagecontent``
+        出现；若仍为空则重试几次（换新导航），避免整话漏下。
+        """
+        for attempt in range(3):
+            html = self.net.get_text(chapter.url, referer=base, wait_for="imagecontent")
+            soup = _soup(html)
+            urls: List[str] = []
+            for img in soup.find_all("img", class_="imagecontent"):
+                src = img.get("data-src") or img.get("src")
+                if src and not src.startswith("data:"):
+                    urls.append(self._abs(src, base))
+            if urls:
+                log.debug("话 %r 解析到 %d 张图片", chapter.title, len(urls))
+                return urls
+            log.debug("话 %r 第 %d 次解析到 0 张，重试", chapter.title, attempt + 1)
+        log.warning("话 %r 多次尝试仍解析到 0 张图片", chapter.title)
+        return []
 
     @staticmethod
     def _abs(url: str, base: str) -> str:

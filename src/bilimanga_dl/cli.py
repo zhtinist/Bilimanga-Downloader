@@ -126,6 +126,7 @@ def run_download(config: Config, url_or_no: str) -> None:
 
     dvs = _download_with_progress(downloader, book, volumes, TEMP_DOWNLOAD_DIR)
 
+    import shutil
     outputs: List[Path] = []
     for dv in dvs:
         if not any(dc.images for dc in dv.chapters):
@@ -135,15 +136,20 @@ def run_download(config: Config, url_or_no: str) -> None:
             out = build_epub(book, dv, target) if fmt == "epub" else build_pdf(book, dv, target)
             outputs.append(out)
             _print(f"  [green]✓ {out.name}[/green]")
+            # 打包成功后立即清理该卷的临时图片目录
+            shutil.rmtree(dv.dir, ignore_errors=True)
         except Exception as exc:
             _print(f"  [red]打包失败（{dv.volume.title}）：{exc}[/red]")
 
     net.close()
 
-    # 全部成功则清理该书的临时图片目录（部分失败则保留，便于下次续传）
-    if outputs and len(outputs) == len(volumes):
-        import shutil
-        shutil.rmtree(TEMP_DOWNLOAD_DIR / safe_name(book.title), ignore_errors=True)
+    # 收尾：若该书临时目录已空则一并删除
+    book_temp = TEMP_DOWNLOAD_DIR / safe_name(book.title)
+    try:
+        if book_temp.exists() and not any(book_temp.iterdir()):
+            book_temp.rmdir()
+    except OSError:
+        pass
 
     _print(f"\n[bold green]全部完成，共 {len(outputs)} 个文件 → {target}[/bold green]")
 

@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import base64
+import json
 import os
 import queue
 import random
@@ -47,6 +48,7 @@ def ensure_local_no_proxy() -> None:
         os.environ[key] = ",".join(parts)
 
 from .config import Config
+from .imageutil import save_as_jpeg
 from .logutil import get_logger
 
 log = get_logger("net")
@@ -129,6 +131,39 @@ def _detect_browser_path() -> Optional[str]:
     return None
 
 
+# 扫描阅读页：返回 [图片总数, 已加载数, data-src 列表]
+_SCAN_JS = r"""
+var g = document.querySelectorAll('img.imagecontent');
+var loaded = 0, urls = [];
+for (var i = 0; i < g.length; i++) {
+  if (g[i].complete && g[i].naturalWidth > 0) loaded++;
+  urls.push(g[i].getAttribute('data-src') || g[i].getAttribute('src') || '');
+}
+return [g.length, loaded, urls];
+"""
+
+# 同源批量抓取：一次 Promise.all 并发 fetch 多张图。用 force-cache 优先读浏览器缓存
+# （页面已原生加载过这些图），命中则不触发网络请求、不会 429。run_js 不支持 list，
+# 故用 JSON 字符串传参；标签须已在图片同源上。
+_BATCH_JS = r"""
+const urls = JSON.parse(arguments[0]);
+return (async () => {
+  const out = new Array(urls.length).fill(null);
+  await Promise.all(urls.map(async (u, i) => {
+    try {
+      const r = await fetch(u, {credentials: 'include', cache: 'force-cache'});
+      if (!r.ok) { out[i] = 'ERR' + r.status; return; }
+      const b = await r.arrayBuffer();
+      const a = new Uint8Array(b);
+      let s = ''; const C = 0x8000;
+      for (let j = 0; j < a.length; j += C) s += String.fromCharCode.apply(null, a.subarray(j, j + C));
+      out[i] = btoa(s);
+    } catch (e) { out[i] = 'ERR:' + e; }
+  }));
+  return out;
+})();
+"""
+
 # 在页面上下文内用同步 XHR 抓取二进制并 base64 返回（复用浏览器 cookie + 指纹）
 _XHR_JS = r"""
 var url = arguments[0];
@@ -158,10 +193,12 @@ class BrowserEngine:
     def __init__(self, config: Config):
         self.config = config
         self._browser = None
-        self._tab = None                 # 主标签:加载页面
-        self._lock = threading.RLock()   # 保护主标签
-        self._pool: Optional[queue.Queue] = None  # 图片下载标签池
+        self._tab = None                 # 首个标签
+        self._lock = threading.RLock()
+        self._pool: Optional[queue.Queue] = None  # 标签池（页面与图片共用）
         self._pool_lock = threading.Lock()
+        self._tab_count = 0
+        self._max_tabs = max(1, config.parallel_chapters)  # 标签上限=并发上限
 
     def _ensure(self):
         if self._tab is not None:
@@ -184,15 +221,23 @@ class BrowserEngine:
             co.headless(True)
         co.set_argument("--no-first-run")
         co.set_argument("--no-default-browser-check")
+        co.set_argument("--disk-cache-size=1073741824")  # 1GB 磁盘缓存，利于 force-cache 命中
+        # 站点/图片流量优先走代理（配置优先，其次系统环境变量）
+        proxy = self.config.proxy or os.environ.get("https_proxy") or \
+            os.environ.get("http_proxy") or os.environ.get("HTTPS_PROXY") or \
+            os.environ.get("HTTP_PROXY") or os.environ.get("ALL_PROXY")
+        if proxy:
+            try:
+                co.set_proxy(proxy)
+                log.info("浏览器走代理: %s", proxy)
+            except Exception as exc:
+                log.warning("设置浏览器代理失败: %s", exc)
         log.info("正在启动本地浏览器过 Cloudflare（%s，headless=%s）……",
                  browser_path, self.config.browser_headless)
         self._browser = Chromium(co)
         self._tab = self._browser.latest_tab
 
-    # ---- 统一标签池（页面与图片共用，支持并行） ----
-    def _pool_size(self) -> int:
-        return max(1, self.config.parallel_chapters)
-
+    # ---- 统一标签池（按需懒增长到上限，配合自适应并发） ----
     def _ensure_pool(self):
         if self._pool is not None:
             return
@@ -200,19 +245,24 @@ class BrowserEngine:
             if self._pool is not None:
                 return
             self._ensure()
-            pool: queue.Queue = queue.Queue()
-            pool.put(self._tab)  # 首个标签
-            for _ in range(self._pool_size() - 1):
-                try:
-                    pool.put(self._browser.new_tab())
-                except Exception:
-                    break
-            self._pool = pool
-            log.debug("[browser] 标签池大小=%d", pool.qsize())
+            self._pool = queue.Queue()
+            self._pool.put(self._tab)
+            self._tab_count = 1
+            log.debug("[browser] 标签池初始化(上限 %d)", self._max_tabs)
 
     def _borrow(self):
         self._ensure_pool()
-        return self._pool.get()
+        with self._pool_lock:
+            if not self._pool.empty():
+                return self._pool.get_nowait()
+            if self._tab_count < self._max_tabs:
+                try:
+                    tab = self._browser.new_tab()
+                    self._tab_count += 1
+                    return tab
+                except Exception:
+                    pass
+        return self._pool.get()  # 已达上限：等待归还
 
     def _release(self, tab):
         if self._pool is not None:
@@ -223,7 +273,7 @@ class BrowserEngine:
         p = urlparse(u or "")
         return f"{p.scheme}://{p.netloc}"
 
-    def get_html(self, url: str) -> str:
+    def get_html(self, url: str, wait_for: Optional[str] = None) -> str:
         tab = self._borrow()
         try:
             log.debug("[browser] GET %s", url)
@@ -235,7 +285,6 @@ class BrowserEngine:
                 time.sleep(1.5)
                 html = tab.html or ""
                 state = _html_state(html)
-            log.debug("[browser] ← %s state=%s len=%d", url, state, len(html))
             if state == "blocked":
                 raise CloudflareBlocked(
                     f"该 IP 被 Cloudflare 硬封禁: {url}（请更换住宅代理节点后重试）"
@@ -244,6 +293,14 @@ class BrowserEngine:
                 raise CloudflareBlocked(
                     f"等待 {self.config.cloudflare_wait}s 仍未通过 Cloudflare: {url}"
                 )
+            # 等待 JS 注入的目标内容出现（如阅读页的 imagecontent 懒加载图片）
+            if wait_for and wait_for not in html:
+                wdeadline = time.time() + 15
+                while wait_for not in html and time.time() < wdeadline:
+                    time.sleep(0.5)
+                    html = tab.html or ""
+            log.debug("[browser] ← %s state=%s len=%d wait_for=%s hit=%s",
+                      url, state, len(html), wait_for, (wait_for in html) if wait_for else "-")
             return html
         finally:
             self._release(tab)
@@ -266,12 +323,13 @@ class BrowserEngine:
             log.debug("预热失败(忽略): %s", exc)
 
     def get_image_bytes(self, url: str) -> bytes:
+        # 内部只做 2 次轻量尝试；速率限制(429)交给上层自适应并发控制处理，
+        # 以便把“拥塞信号”快速反馈给控制器（而不是在这里死磕重试掩盖信号）。
         tab = self._borrow()
         try:
             target_origin = self._origin(url)
             last = ""
-            for attempt in range(5):
-                # 标签不在图片域名上时才整页导航（一次即可）；之后同源 XHR 直接取。
+            for attempt in range(2):
                 try:
                     cur_origin = self._origin(tab.url or "")
                 except Exception:
@@ -281,17 +339,121 @@ class BrowserEngine:
                         tab.get(url)
                     except Exception as exc:
                         last = str(exc)
-                        time.sleep(1.0 + attempt)
+                        time.sleep(0.5)
                         continue
-                    deadline = time.time() + min(self.config.cloudflare_wait, 20)
+                    deadline = time.time() + min(self.config.cloudflare_wait, 15)
                     while _html_state(tab.html or "") == "challenge" and time.time() < deadline:
                         time.sleep(1.0)
                 res = tab.run_js(_XHR_JS, url)
                 if isinstance(res, str) and not res.startswith("ERR"):
                     return base64.b64decode(res)
                 last = str(res)
-                time.sleep(0.6 + attempt)  # 递增退避，缓解速率质询
             raise RuntimeError(f"浏览器下载图片失败({last[:80]}): {url}")
+        finally:
+            self._release(tab)
+
+    @staticmethod
+    def _valid_file(path) -> bool:
+        try:
+            return path.exists() and path.stat().st_size > 1000
+        except OSError:
+            return False
+
+    def download_chapter(self, chapter_url, dest_dir, prefix, resume=True,
+                         on_scanned=None, on_saved=None):
+        """在一个标签上完成一话的下载（模拟看漫画 + 落盘），返回已保存 jpg 路径列表。
+
+        流程：①导航阅读页 + 滚动触发浏览器**原生并发加载**所有图（快、不 429）；
+        ②读取有序 data-src；③导航到图片同源，用 force-cache 批量读缓存（多数命中，秒取）；
+        ④少数未命中用逐张同步 XHR 兜底（可靠）。
+        """
+        tab = self._borrow()
+        saved = []
+        try:
+            # ① 加载阅读页并过 Cloudflare
+            tab.get(chapter_url)
+            dl = time.time() + self.config.cloudflare_wait
+            while _html_state(tab.html or "") == "challenge" and time.time() < dl:
+                time.sleep(1.0)
+            # 滚动触发懒加载，直到全部 complete（或超时）
+            deadline = time.time() + max(25, self.config.cloudflare_wait)
+            n, loaded, urls = tab.run_js(_SCAN_JS)
+            while time.time() < deadline:
+                if n > 0 and loaded >= n:
+                    break
+                tab.scroll.down(4000)
+                time.sleep(0.25)
+                n, loaded, urls = tab.run_js(_SCAN_JS)
+            urls = [u for u in (urls or []) if u]
+            if on_scanned:
+                on_scanned(len(urls))
+            if not urls:
+                return saved
+
+            Path(dest_dir).mkdir(parents=True, exist_ok=True)
+            dests = [Path(dest_dir) / f"{prefix}_{ii:04d}.jpg" for ii in range(len(urls))]
+
+            # 断点续传：已存在的直接计入
+            need = []
+            for u, dd in zip(urls, dests):
+                if resume and self._valid_file(dd):
+                    saved.append(dd)
+                    if on_saved:
+                        on_saved()
+                else:
+                    need.append((u, dd))
+            if not need:
+                return saved
+
+            # ③ 导航到图片同源，force-cache 批量读缓存
+            origin = self._origin(need[0][0])
+            try:
+                if self._origin(tab.url or "") != origin:
+                    tab.get(need[0][0])
+                    time.sleep(0.3)
+            except Exception:
+                pass
+
+            still = []
+            for i in range(0, len(need), 12):
+                chunk = need[i:i + 12]
+                try:
+                    res = tab.run_js(_BATCH_JS, json.dumps([u for u, _ in chunk]))
+                except Exception:
+                    res = None
+                if isinstance(res, list):
+                    for (u, dd), x in zip(chunk, res):
+                        if isinstance(x, str) and not x.startswith("ERR"):
+                            try:
+                                save_as_jpeg(base64.b64decode(x), dd)
+                                saved.append(dd)
+                                if on_saved:
+                                    on_saved()
+                                continue
+                            except Exception:
+                                pass
+                        still.append((u, dd))
+                else:
+                    still.extend(chunk)
+
+            # ④ 未命中的逐张同步 XHR 兜底（可靠，轻量重试）
+            for u, dd in still:
+                for _ in range(3):
+                    try:
+                        r = tab.run_js(_XHR_JS, u)
+                    except Exception:
+                        r = None
+                    if isinstance(r, str) and not r.startswith("ERR"):
+                        try:
+                            save_as_jpeg(base64.b64decode(r), dd)
+                            saved.append(dd)
+                            if on_saved:
+                                on_saved()
+                        except Exception:
+                            pass
+                        break
+                    time.sleep(0.6)
+            return saved
         finally:
             self._release(tab)
 
@@ -421,9 +583,10 @@ class Net:
                 continue
         raise CloudflareBlocked("所有镜像域名均无法访问：\n" + "\n".join(errors))
 
-    def get_text(self, url: str, *, referer: Optional[str] = None) -> str:
+    def get_text(self, url: str, *, referer: Optional[str] = None,
+                 wait_for: Optional[str] = None) -> str:
         if self.browser:
-            return self.browser.get_html(url)
+            return self.browser.get_html(url, wait_for=wait_for)
         resp = self._requests_fetch(url, referer=referer)
         resp.encoding = resp.apparent_encoding or "utf-8"
         return resp.text
@@ -434,6 +597,13 @@ class Net:
             return self.browser.get_image_bytes(url)
         resp = self._requests_fetch(url, referer=referer, stream=True)
         return resp.content
+
+    def download_chapter(self, chapter_url, dest_dir, prefix, resume=True,
+                         on_scanned=None, on_saved=None):
+        """浏览器模式：一话内原生加载+缓存批量+XHR兜底下载到 dest_dir，返回已存 jpg 路径。"""
+        return self.browser.download_chapter(
+            chapter_url, dest_dir, prefix, resume=resume,
+            on_scanned=on_scanned, on_saved=on_saved)
 
     def close(self) -> None:
         try:

@@ -78,19 +78,10 @@ def build_epub(book: Book, dv: DownloadedVolume, out_dir: Path) -> Path:
     toc: List = []
     img_counter = 0
 
-    # 封面：手动添加图片 + 自建封面页（set_cover 自动页在 ebooklib 0.20
-    # 的分页扫描中 body 为空会报错，故 create_page=False）。
+    # 封面 = 该卷第一张图（仅设为封面元数据/缩略图；第一张图本身也是正文第 1 页，
+    # 不再另建重复的封面页）。create_page=False 兼容 ebooklib 0.20 的分页扫描。
     if dv.cover and dv.cover.exists():
         ebook.set_cover("cover.jpg", dv.cover.read_bytes(), create_page=False)
-        try:
-            cw, ch = image_size(dv.cover)
-        except Exception:
-            cw, ch = 800, 1200
-        cover_page = epub.EpubHtml(title="封面", file_name="text/cover.xhtml", lang="zh")
-        cover_page.content = _page_xhtml("../cover.jpg", cw, ch, "封面")
-        cover_page.add_item(css)
-        ebook.add_item(cover_page)
-        spine.append(cover_page)
 
     for dchap in dv.chapters:
         if not dchap.images:
