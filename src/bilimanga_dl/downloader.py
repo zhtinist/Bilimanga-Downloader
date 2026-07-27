@@ -59,9 +59,15 @@ class DownloadedVolume:
 
 
 class _Adaptive:
-    """自适应并发限流器（AIMD）：按网络反馈实时调整同时下载的图片数。
+    """自适应并发限流器：每 1 秒按这一秒的错误率决定加/减并发。
 
-    连续成功若干次则 +1（加性增），遇失败/429 则乘性减，介于 [lo, hi]。
+    - 加线程随时生效（放开信号量，新任务立即可进）。
+    - 减线程是**优雅缩减**：只降上限 ``limit``，正在下载的线程不打断，
+      等它们自然结束后不再派新活即可（不掐断、不重下、不浪费）。
+    - 决策（每秒采样一次这一秒内的成功/失败）：
+        错误率 == 0        → +1（顺利就加）
+        错误率 >= 40%      → -2（猛减，明显被限速）
+        0 < 错误率 < 40%   → -1（温和减）
     """
 
     def __init__(self, start: int, lo: int, hi: int):
@@ -69,12 +75,24 @@ class _Adaptive:
         self.lo, self.hi = lo, hi
         self._active = 0
         self._ok = 0
+        self._fail = 0
+        self._stop = False
         self._cv = threading.Condition()
+        self._mon: Optional[threading.Thread] = None
+
+    def start(self):
+        self._mon = threading.Thread(target=self._loop, daemon=True)
+        self._mon.start()
+
+    def stop(self):
+        with self._cv:
+            self._stop = True
+            self._cv.notify_all()
 
     def acquire(self):
         with self._cv:
-            while self._active >= self.limit:
-                self._cv.wait()
+            while self._active >= self.limit and not self._stop:
+                self._cv.wait(timeout=0.5)
             self._active += 1
 
     def release(self, ok: bool):
@@ -82,13 +100,28 @@ class _Adaptive:
             self._active -= 1
             if ok:
                 self._ok += 1
-                if self._ok >= 6 and self.limit < self.hi:
-                    self.limit += 1
-                    self._ok = 0
             else:
-                self._ok = 0
-                self.limit = max(self.lo, self.limit - 2)
+                self._fail += 1
             self._cv.notify_all()
+
+    def _loop(self):
+        while True:
+            time.sleep(1.0)
+            with self._cv:
+                if self._stop:
+                    return
+                total = self._ok + self._fail
+                if total > 0:
+                    rate = self._fail / total
+                    if rate == 0:
+                        self.limit = min(self.hi, self.limit + 1)
+                    elif rate >= 0.40:
+                        self.limit = max(self.lo, self.limit - 2)
+                    else:
+                        self.limit = max(self.lo, self.limit - 1)
+                    self._ok = self._fail = 0
+                    self._cv.notify_all()
+                    log.debug("并发调节: 上限=%d (本秒成功后清零)", self.limit)
 
 
 class Downloader:
@@ -300,6 +333,7 @@ class Downloader:
 
         ceiling = max(2, self.config.parallel_chapters)
         limiter = _Adaptive(start=min(ceiling, 4), lo=2, hi=min(ceiling, 8))
+        limiter.start()  # 启动每秒错误率采样的并发调节器
         img_pool = ThreadPoolExecutor(max_workers=max(2, min(ceiling, 8)))
         pkg_pool = ThreadPoolExecutor(max_workers=2)  # 后台校对+打包
         outputs: list = []
@@ -401,6 +435,7 @@ class Downloader:
                 f.result()
             except Exception:
                 pass
+        limiter.stop()
         img_pool.shutdown(wait=False)
         pkg_pool.shutdown(wait=True)
         return outputs
