@@ -208,7 +208,7 @@ class Downloader:
                     except Exception:
                         pass
 
-        for _round in range(3):
+        for _round in range(max(0, self.config.retry_missing_rounds)):
             left = _missing()
             if not left:
                 break
