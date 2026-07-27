@@ -190,26 +190,32 @@ class Downloader:
             with ThreadPoolExecutor(max_workers=par) as pool:
                 list(pool.map(do_chunk, chunks))
 
-        # 补漏：并行首轮可能因速率质询掉几张，对仍缺失的再补下几轮直到齐
+        # 静默补漏：首轮并发可能因速率质询掉几张，这里【不展示进度、自动完成】。
+        # 用批量抓取快速补齐，用户视角进度条已到 100%，随后直接进入打包。
         def _missing():
             return [t for t in img_tasks if not self._valid_jpeg(t[1])]
+
+        def _redl_chunk(chunk):
+            urls = [t[0] for t in chunk]
+            try:
+                datas = self.net.get_images_batch(urls)
+            except Exception:
+                datas = [None] * len(chunk)
+            for (u, dest, ref), data in zip(chunk, datas):
+                if data:
+                    try:
+                        save_as_jpeg(data, dest)
+                    except Exception:
+                        pass
 
         for _round in range(3):
             left = _missing()
             if not left:
                 break
-            log.info("补漏第 %d 轮：重试 %d 张", _round + 1, len(left))
-            if progress_cb:
-                progress_cb(f"补漏重试({len(left)})", total, total)
-
-            def redl(task):
-                try:
-                    self._download_one(*task)
-                except Exception:
-                    pass
-
+            log.info("静默补漏第 %d 轮：%d 张（不展示进度）", _round + 1, len(left))
+            chs = [left[i:i + CHUNK] for i in range(0, len(left), CHUNK)]
             with ThreadPoolExecutor(max_workers=par) as pool:
-                list(pool.map(redl, left))
+                list(pool.map(_redl_chunk, chs))
 
         still = _missing()
         if still:
