@@ -118,28 +118,15 @@ def run_download(config: Config, url_or_no: str) -> None:
     # 下载：临时图片放 temp/download/<书名>/，成品放 downloads/<书名>/
     target = DOWNLOADS_DIR / safe_name(book.title)
     target.mkdir(parents=True, exist_ok=True)
-    _rule("开始下载")
-    _print(f"输出目录：[bold]{target}[/bold]（并发 {config.parallel_chapters} 话）")
+    _rule("开始下载（流水线：下载→校对→打包，逐卷产出）")
+    _print(f"输出目录：[bold]{target}[/bold]")
     downloader = Downloader(net, scraper, config)
     index_map = {v.index: v for v in book.volumes}
     volumes = [index_map[i] for i in selected]
+    build_fn = build_epub if fmt == "epub" else build_pdf
 
-    dvs = _download_with_progress(downloader, book, volumes, TEMP_DOWNLOAD_DIR)
-
-    import shutil
-    outputs: List[Path] = []
-    for dv in dvs:
-        if not any(dc.images for dc in dv.chapters):
-            _print(f"  [yellow]跳过（无图片）：{dv.volume.title}[/yellow]")
-            continue
-        try:
-            out = build_epub(book, dv, target) if fmt == "epub" else build_pdf(book, dv, target)
-            outputs.append(out)
-            _print(f"  [green]✓ {out.name}[/green]")
-            # 打包成功后立即清理该卷的临时图片目录
-            shutil.rmtree(dv.dir, ignore_errors=True)
-        except Exception as exc:
-            _print(f"  [red]打包失败（{dv.volume.title}）：{exc}[/red]")
+    outputs = _run_pipeline_with_progress(
+        downloader, book, volumes, TEMP_DOWNLOAD_DIR, target, build_fn)
 
     net.close()
 
@@ -154,7 +141,9 @@ def run_download(config: Config, url_or_no: str) -> None:
     _print(f"\n[bold green]全部完成，共 {len(outputs)} 个文件 → {target}[/bold green]")
 
 
-def _download_with_progress(downloader: Downloader, book: Book, volumes, work_dir: Path):
+def _run_pipeline_with_progress(downloader: Downloader, book: Book, volumes,
+                                temp_dir, out_dir, build_fn):
+    """跑三阶段流水线，显示 下载/扫描 计数器 + 逐卷打包产出。"""
     if _console:
         with Progress(
             TextColumn("[progress.description]{task.description}"),
@@ -163,20 +152,28 @@ def _download_with_progress(downloader: Downloader, book: Book, volumes, work_di
             TimeRemainingColumn(),
             console=_console,
         ) as progress:
-            task_id = progress.add_task("准备中……", total=None)
+            task_id = progress.add_task("下载/扫描", total=None)
 
-            def cb(desc: str, done: int, total: int):
+            def cb(desc, done, total):
                 progress.update(task_id, description=desc, completed=done,
                                 total=total if total else None)
 
-            return downloader.download_selected(book, volumes, work_dir, progress_cb=cb)
-    else:
-        def cb(desc: str, done: int, total: int):
-            print(f"\r  {desc}  {done}/{total}", end="", flush=True)
+            def packaged(path, vol):
+                progress.console.print(f"  [green]✓ 已产出：{path.name}[/green]")
 
-        dvs = downloader.download_selected(book, volumes, work_dir, progress_cb=cb)
+            return downloader.run_pipeline(book, volumes, temp_dir, out_dir, build_fn,
+                                           progress_cb=cb, on_packaged=packaged)
+    else:
+        def cb(desc, done, total):
+            print(f"\r  {desc} {done}/{total}", end="", flush=True)
+
+        def packaged(path, vol):
+            print(f"\n  ✓ 已产出：{path.name}")
+
+        out = downloader.run_pipeline(book, volumes, temp_dir, out_dir, build_fn,
+                                      progress_cb=cb, on_packaged=packaged)
         print()
-        return dvs
+        return out
 
 
 def _print_help() -> None:
