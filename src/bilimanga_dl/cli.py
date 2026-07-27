@@ -1,0 +1,235 @@
+"""命令行主流程（纯命令行为默认；--gui 可选图形界面）。"""
+
+from __future__ import annotations
+
+import sys
+import webbrowser
+from pathlib import Path
+from typing import List, Optional
+
+from .build_epub import build_epub
+from .build_pdf import build_pdf
+from .config import Config, DOWNLOADS_DIR, TEMP_DOWNLOAD_DIR
+from .downloader import Downloader, safe_name
+from .logutil import debug_requested, get_logger, setup_logging
+from .models import Book
+from .net import Net
+from .scraper import Scraper, parse_book_no
+from .ui.confirm import confirm_book
+from .ui.picker import pick_volumes
+from .ui.settings import open_settings
+
+try:
+    from rich.console import Console
+    from rich.progress import (BarColumn, Progress, TextColumn,
+                               TimeRemainingColumn)
+    _console: Optional[Console] = Console()
+except Exception:  # rich 不是硬依赖
+    _console = None
+
+
+def _print(msg: str = "") -> None:
+    if _console:
+        _console.print(msg)
+    else:
+        # 去掉 rich 标记再打印
+        import re
+        print(re.sub(r"\[/?[a-z0-9 #]+\]", "", msg))
+
+
+def _rule(title: str) -> None:
+    if _console:
+        _console.rule(f"[bold cyan]{title}")
+    else:
+        print("\n" + "=" * 4 + f" {title} " + "=" * 4)
+
+
+def _prompt(msg: str) -> str:
+    return input(msg)
+
+
+# ---------------- 各步骤 ----------------
+def choose_format(config: Config) -> str:
+    _rule("第 4 步 / 共 4 步：选择输出格式")
+    default = config.default_format
+    _print("可选格式：epub（电子书阅读器）/ pdf（通用，按原图整页排版）")
+    while True:
+        ans = _prompt(f"→ 输入 epub 或 pdf（直接回车用默认 {default}）：").strip().lower()
+        if not ans:
+            return default
+        if ans in ("epub", "pdf"):
+            return ans
+        _print("  请输入 epub 或 pdf。")
+
+
+def run_download(config: Config, url_or_no: str) -> None:
+    net = Net(config)
+    scraper = Scraper(net)
+
+    # 解析书号（本地，无需联网）
+    try:
+        book_no = parse_book_no(url_or_no)
+    except ValueError as exc:
+        _print(f"[red]{exc}[/red]")
+        net.close()
+        return
+
+    # 第 1 步：确认漫画 —— 先秒开浏览器主页，同时后台预热自动化浏览器过 Cloudflare
+    _rule("第 1 步 / 共 4 步：确认漫画")
+    detail_url = f"{config.mirrors[0].rstrip('/')}/detail/{book_no}.html"
+    net.warm_up(detail_url)  # 后台启动 Chrome + 预过 Cloudflare，隐藏冷启动耗时
+    try:
+        webbrowser.open(detail_url)
+        _print(f"  已在浏览器打开主页供你核对：{detail_url}")
+    except Exception:
+        _print(f"  主页：{detail_url}")
+    ans = _prompt("→ 是这本吗？回车/y 确认，n 取消：").strip().lower()
+    if ans not in ("", "y", "yes"):
+        _print("已取消。")
+        net.close()
+        return
+
+    # 第 2 步：解析目录
+    _rule("第 2 步 / 共 4 步：解析目录")
+    _print("正在解析……（首次需启动浏览器过 Cloudflare，约 10–20 秒，可加 --debug 看详情）")
+    try:
+        book: Book = scraper.fetch_book(book_no)
+    except Exception as exc:
+        _print(f"[red]获取书籍信息失败：{exc}[/red]")
+        net.close()
+        return
+    if not book.volumes:
+        _print("[red]未解析到任何章节，可能是页面结构变化或该书需要登录。[/red]")
+        net.close()
+        return
+    _print(f"  [bold]{book.title}[/bold]　{book.author}　共 {len(book.volumes)} 章")
+
+    # 第 3 步（选章）
+    _rule("第 3 步 / 共 4 步：选择要下载的章")
+    selected = pick_volumes(book.volumes, use_terminal=True)
+    if not selected:
+        _print("未选择任何章，已取消。")
+        net.close()
+        return
+
+    # 第 4 步：格式
+    fmt = choose_format(config)
+
+    # 下载：临时图片放 temp/download/<书名>/，成品放 downloads/<书名>/
+    target = DOWNLOADS_DIR / safe_name(book.title)
+    target.mkdir(parents=True, exist_ok=True)
+    _rule("开始下载")
+    _print(f"输出目录：[bold]{target}[/bold]（并发 {config.parallel_chapters} 话）")
+    downloader = Downloader(net, scraper, config)
+    index_map = {v.index: v for v in book.volumes}
+    volumes = [index_map[i] for i in selected]
+
+    dvs = _download_with_progress(downloader, book, volumes, TEMP_DOWNLOAD_DIR)
+
+    outputs: List[Path] = []
+    for dv in dvs:
+        if not any(dc.images for dc in dv.chapters):
+            _print(f"  [yellow]跳过（无图片）：{dv.volume.title}[/yellow]")
+            continue
+        try:
+            out = build_epub(book, dv, target) if fmt == "epub" else build_pdf(book, dv, target)
+            outputs.append(out)
+            _print(f"  [green]✓ {out.name}[/green]")
+        except Exception as exc:
+            _print(f"  [red]打包失败（{dv.volume.title}）：{exc}[/red]")
+
+    net.close()
+    _print(f"\n[bold green]全部完成，共 {len(outputs)} 个文件 → {target}[/bold green]")
+
+
+def _download_with_progress(downloader: Downloader, book: Book, volumes, work_dir: Path):
+    if _console:
+        with Progress(
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(),
+            TextColumn("{task.completed}/{task.total}"),
+            TimeRemainingColumn(),
+            console=_console,
+        ) as progress:
+            task_id = progress.add_task("准备中……", total=None)
+
+            def cb(desc: str, done: int, total: int):
+                progress.update(task_id, description=desc, completed=done,
+                                total=total if total else None)
+
+            return downloader.download_selected(book, volumes, work_dir, progress_cb=cb)
+    else:
+        def cb(desc: str, done: int, total: int):
+            print(f"\r  {desc}  {done}/{total}", end="", flush=True)
+
+        dvs = downloader.download_selected(book, volumes, work_dir, progress_cb=cb)
+        print()
+        return dvs
+
+
+def _print_help() -> None:
+    _print("用法：")
+    _print("  python3 start.py                进入交互式命令行菜单")
+    _print("  python3 start.py <URL>          直接下载指定漫画")
+    _print("  python3 start.py --gui          使用图形界面")
+    _print("  python3 start.py --cli          强制命令行（默认即命令行）")
+    _print("  python3 start.py --debug        开启调试日志")
+    _print("  输入支持三种：详情页链接 / 目录页链接 / 书号，例如：")
+    _print("    python3 start.py https://www.bilimanga.net/detail/703.html")
+    _print("    python3 start.py https://www.bilimanga.net/read/703/catalog")
+    _print("    python3 start.py 703")
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    argv = argv if argv is not None else sys.argv[1:]
+    config = Config.load()
+
+    # 调试日志：命令行 --debug / 环境变量 / 配置任一开启即生效
+    debug_on = debug_requested(config.debug)
+    log_path = setup_logging(debug_on)
+    if debug_on:
+        _print(f"[调试] 日志已开启，写入：{log_path}")
+
+    want_gui = "--gui" in argv
+    if "--help" in argv or "-h" in argv:
+        _print_help()
+        return 0
+    # 去掉开关参数，剩下的第一个非开关项当作 URL
+    argv = [a for a in argv if a not in ("--debug", "--cli", "--gui")]
+
+    # 图形界面（可选）
+    if want_gui:
+        from .ui.tk_common import tk_available
+        if tk_available():
+            from .ui.app import launch
+            launch(config)
+            return 0
+        _print("未检测到图形环境，回退到命令行界面。")
+
+    # 命令行：带 URL 参数直接下载
+    if argv:
+        run_download(config, argv[0])
+        return 0
+
+    # 交互式菜单
+    while True:
+        _rule("bilimanga.net 漫画下载器")
+        _print("  1) 下载漫画")
+        _print("  2) 设置")
+        _print("  3) 退出")
+        choice = _prompt("→ 请选择 [1]：").strip() or "1"
+        if choice == "1":
+            _print("支持以下任一输入（三选一）：")
+            _print("  · 详情页链接：https://www.bilimanga.net/detail/703.html")
+            _print("  · 目录页链接：https://www.bilimanga.net/read/703/catalog")
+            _print("  · 漫画书号：  703")
+            url = _prompt("→ 请粘贴链接或书号：").strip()
+            if url:
+                run_download(config, url)
+        elif choice == "2":
+            open_settings(config, use_terminal=True)
+        elif choice in ("3", "q", "quit", "exit"):
+            _print("再见！")
+            return 0
+        else:
+            _print("无效选择，请输入 1 / 2 / 3。")

@@ -1,0 +1,10 @@
+.venv/
+__pycache__/
+*.pyc
+.DS_Store
+
+# 运行时在项目根目录内生成的数据
+/config/
+/logs/
+/downloads/
+/temp/

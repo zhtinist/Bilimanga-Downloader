@@ -1,0 +1,11 @@
+# 跨平台依赖，pip install -r requirements.txt
+requests>=2.31.0
+beautifulsoup4>=4.12.0
+lxml>=5.0.0
+rich>=13.0.0
+# 用真实浏览器过 Cloudflare（需本机已装 Chrome/Edge）
+DrissionPage>=4.0.0
+ebooklib>=0.18
+img2pdf>=0.5.1
+Pillow>=10.0.0
+pillow-avif-plugin>=1.4.0
