@@ -229,21 +229,8 @@ class BrowserEngine:
             co.headless(True)
         co.set_argument("--no-first-run")
         co.set_argument("--no-default-browser-check")
-        # 仅在显式配置 proxy 时才设代理；否则用默认（实测最快，不要加 --no-proxy-server）。
-        if self.config.proxy:
-            co.set_proxy(self.config.proxy)
-            log.info("浏览器走代理: %s", self.config.proxy)
-        co.set_argument("--disk-cache-size=1073741824")  # 1GB 磁盘缓存，利于 force-cache 命中
-        # 站点/图片流量优先走代理（配置优先，其次系统环境变量）
-        proxy = self.config.proxy or os.environ.get("https_proxy") or \
-            os.environ.get("http_proxy") or os.environ.get("HTTPS_PROXY") or \
-            os.environ.get("HTTP_PROXY") or os.environ.get("ALL_PROXY")
-        if proxy:
-            try:
-                co.set_proxy(proxy)
-                log.info("浏览器走代理: %s", proxy)
-            except Exception as exc:
-                log.warning("设置浏览器代理失败: %s", exc)
+        # 网络：不做任何特别设置，浏览器沿用它自身/系统的网络环境即可
+        # （不 set_proxy、不 --no-proxy-server，实测这样最快且最稳）。
         log.info("正在启动本地浏览器过 Cloudflare（%s，headless=%s）……",
                  browser_path, self.config.browser_headless)
         self._browser = Chromium(co)
