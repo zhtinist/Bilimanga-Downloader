@@ -1,4 +1,4 @@
-"""命令行主流程（纯命令行为默认；--gui 可选图形界面）。"""
+"""命令行主流程（纯命令行工具；图形界面见浏览器插件 crx/）。"""
 
 from __future__ import annotations
 
@@ -15,7 +15,6 @@ from .logutil import debug_requested, get_logger, setup_logging
 from .models import Book
 from .net import Net
 from .scraper import Scraper, parse_book_no
-from .ui.confirm import confirm_book
 from .ui.picker import pick_volumes
 from .ui.settings import open_settings
 
@@ -74,34 +73,52 @@ def run_download(config: Config, url_or_no: str) -> None:
         net.close()
         return
 
-    # 第 1 步：确认漫画 —— 先秒开浏览器主页，同时后台预热自动化浏览器过 Cloudflare
+    # 第 1 步：确认漫画
     _rule("第 1 步 / 共 4 步：确认漫画")
     detail_url = f"{config.mirrors[0].rstrip('/')}/detail/{book_no}.html"
     net.warm_up(detail_url)  # 后台启动 Chrome + 预过 Cloudflare，隐藏冷启动耗时
-    try:
-        webbrowser.open(detail_url)
-        _print(f"  已在浏览器打开主页供你核对：{detail_url}")
-    except Exception:
-        _print(f"  主页：{detail_url}")
+
+    def _parse_book() -> Optional[Book]:
+        _print("正在解析……（首次需启动浏览器过 Cloudflare，约 10–20 秒，可加 --debug 看详情）")
+        try:
+            b = scraper.fetch_book(book_no)
+        except Exception as exc:
+            _print(f"[red]获取书籍信息失败：{exc}[/red]")
+            return None
+        if not b.volumes:
+            _print("[red]未解析到任何章节，可能是页面结构变化或该书需要登录。[/red]")
+            return None
+        return b
+
+    book: Optional[Book] = None
+    if config.confirm_open_browser:
+        # 弹网页核对：先秒开浏览器详情页，隐藏自动化浏览器冷启动耗时
+        try:
+            webbrowser.open(detail_url)
+            _print(f"  已在浏览器打开主页供你核对：{detail_url}")
+        except Exception:
+            _print(f"  主页：{detail_url}")
+    else:
+        # 不弹网页：先解析拿到书名，仅在命令行打印作品名字供核对
+        book = _parse_book()
+        if book is None:
+            net.close()
+            return
+        _print(f"  作品名字：[bold]{book.title}[/bold]　{book.author}　共 {len(book.volumes)} 章")
+
     ans = _prompt("→ 是这本吗？回车/y 确认，n 取消：").strip().lower()
     if ans not in ("", "y", "yes"):
         _print("已取消。")
         net.close()
         return
 
-    # 第 2 步：解析目录
+    # 第 2 步：解析目录（命令行核对模式已在上一步解析完成）
     _rule("第 2 步 / 共 4 步：解析目录")
-    _print("正在解析……（首次需启动浏览器过 Cloudflare，约 10–20 秒，可加 --debug 看详情）")
-    try:
-        book: Book = scraper.fetch_book(book_no)
-    except Exception as exc:
-        _print(f"[red]获取书籍信息失败：{exc}[/red]")
-        net.close()
-        return
-    if not book.volumes:
-        _print("[red]未解析到任何章节，可能是页面结构变化或该书需要登录。[/red]")
-        net.close()
-        return
+    if book is None:
+        book = _parse_book()
+        if book is None:
+            net.close()
+            return
     _print(f"  [bold]{book.title}[/bold]　{book.author}　共 {len(book.volumes)} 章")
 
     # 第 3 步（选章）
@@ -202,9 +219,8 @@ def _print_help() -> None:
     _print("用法：")
     _print("  python3 start.py                进入交互式命令行菜单")
     _print("  python3 start.py <URL>          直接下载指定漫画")
-    _print("  python3 start.py --gui          使用图形界面")
-    _print("  python3 start.py --cli          强制命令行（默认即命令行）")
     _print("  python3 start.py --debug        开启调试日志")
+    _print("  （想要图形界面？见 README 的浏览器插件，crx/ 目录）")
     _print("  输入支持三种：详情页链接 / 目录页链接 / 书号，例如：")
     _print("    python3 start.py https://www.bilimanga.net/detail/703.html")
     _print("    python3 start.py https://www.bilimanga.net/read/703/catalog")
@@ -221,21 +237,11 @@ def main(argv: Optional[List[str]] = None) -> int:
     if debug_on:
         _print(f"[调试] 日志已开启，写入：{log_path}")
 
-    want_gui = "--gui" in argv
     if "--help" in argv or "-h" in argv:
         _print_help()
         return 0
     # 去掉开关参数，剩下的第一个非开关项当作 URL
-    argv = [a for a in argv if a not in ("--debug", "--cli", "--gui")]
-
-    # 图形界面（可选）
-    if want_gui:
-        from .ui.tk_common import tk_available
-        if tk_available():
-            from .ui.app import launch
-            launch(config)
-            return 0
-        _print("未检测到图形环境，回退到命令行界面。")
+    argv = [a for a in argv if a not in ("--debug", "--cli")]
 
     # 命令行：带 URL 参数直接下载
     if argv:

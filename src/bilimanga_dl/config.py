@@ -55,6 +55,10 @@ class Config:
     # 断点续传（1）：已完整下载的文件自动跳过
     resume_enabled: bool = True
 
+    # 确认漫画时是否弹出浏览器打开详情页供核对。
+    # 关闭则不弹网页，仅在命令行打印作品名字供核对（更安静）。
+    confirm_open_browser: bool = False
+
     # 静默补漏轮数：首轮并发下载后对缺失图的补下轮数。
     # 越大越完整但越慢；设 0 则完全不补漏（最快，可能少量缺页）。默认 1（快且基本齐）。
     retry_missing_rounds: int = 1

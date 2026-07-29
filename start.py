@@ -9,8 +9,9 @@
 用法:
     python3 start.py                 # 准备环境并进入交互式命令行菜单
     python3 start.py <URL>           # 直接下载指定漫画
-    python3 start.py --gui           # 使用图形界面(可选)
     python3 start.py --debug         # 开调试日志
+
+图形界面已独立为浏览器插件(见 README 与 crx/ 目录),命令行版为纯命令行工具。
 """
 
 import os
