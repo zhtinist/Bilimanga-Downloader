@@ -2,9 +2,25 @@
 
 **English** · [中文](README.md)
 
-A manga downloader for [bilimanga.net](https://www.bilimanga.net/). Cross-platform (macOS / Windows),
-pure Python: drives a real browser to pass Cloudflare, scrapes the artwork, and packages each
+A manga downloader for [bilimanga.net](https://www.bilimanga.net/): scrapes the artwork and packages each
 volume into **EPUB** or **PDF**.
+
+**Two ways to use it:**
+
+| | CLI (main repo) | 🐵 Userscript ([`userscript/`](userscript)) |
+|---|---|---|
+| For | comfortable with a terminal; wants pipeline / concurrency / resume | **non-technical users**, zero setup |
+| Runtime | Python (`start.py` auto-installs deps) + local Chrome/Edge | **no Python**: install Tampermonkey, then one-click the script |
+| Install | `python3 start.py` | install Tampermonkey from the store → click `bilimanga.user.js` to install, auto-updates |
+| Platform | macOS / Windows | macOS / Windows (any Chromium/Firefox) |
+| Whose CPU | your machine | your machine (script runs same-origin in your own browser) |
+
+> The userscript runs **same-origin inside the bilimanga page**, reusing your **already-passed Cloudflare
+> session** — so no environment to install and no cross-origin issues. While you're on a book's detail /
+> catalog page, a **"⬇ Download this book" button appears on the right edge**; open it to pick chapters +
+> format and download — no pasting URLs, no confirm step.
+> **One-click install:** get [Tampermonkey](https://www.tampermonkey.net/), then open [the script](https://raw.githubusercontent.com/zhtinist/Bilimanga-Downloader/main/userscript/bilimanga.user.js) (Tampermonkey pops up the install page). Details in [`userscript/README.md`](userscript/README.md).
+> The rest of this page documents the **CLI**.
 
 ## Demo (example: book 703《與妳相戀到生命盡頭》)
 
@@ -33,14 +49,17 @@ argument directly:
 python3 start.py https://www.bilimanga.net/detail/703.html   # detail-page URL
 python3 start.py https://www.bilimanga.net/read/703/catalog  # catalog URL
 python3 start.py 703                                         # book id
-python3 start.py --gui      # GUI (optional)
 python3 start.py --debug    # debug logging
 ```
 
+> Want a GUI / zero setup? See the userscript [`userscript/`](userscript) (recommended) or the browser
+> extension [`crx/`](crx) — the CLI itself is now terminal-only.
+
 ## Flow (CLI, 4 steps)
 
-1. **Confirm** — opens the book's page in your default browser for a visual check; press Enter / y
-   (the automation browser is warming up in the background).
+1. **Confirm** — by default just prints the title in the terminal for a quick check; press Enter / y.
+   You can enable "open the page in a browser" in settings for a visual check (the automation browser
+   warms up in the background).
 2. **Parse catalog** — a real browser passes Cloudflare and scrapes the table of contents.
 3. **Pick chapters** — listed as `index + title + which episodes`; type e.g. `1-9,15,19,20-25`
    (Enter = all).
@@ -76,11 +95,12 @@ python3 start.py --debug    # debug logging
 
 ```
 Bilimanga-Downloader/
-├── start.py              # single entry point
+├── start.py              # CLI entry point
 ├── docs/                 # screenshots
 ├── src/
 │   ├── requirements.txt
-│   └── bilimanga_dl/     # source (net / scraper / downloader / build_* / cli / ui …)
+│   └── bilimanga_dl/     # CLI source (net / scraper / downloader / build_* / cli / ui …)
+├── userscript/           # 🐵 userscript build (bilimanga.user.js — zero-setup GUI)
 ├── config/setting.json   # generated at runtime
 ├── logs/  temp/  downloads/<title>/   # generated at runtime (gitignored)
 ```
