@@ -19,7 +19,7 @@ volume into **EPUB** or **PDF**.
 > session** — so no environment to install and no cross-origin issues. While you're on a book's detail /
 > catalog page, a **"⬇ Download this book" button appears on the right edge**; open it to pick chapters +
 > format and download — no pasting URLs, no confirm step.
-> **One-click install:** get [Tampermonkey](https://www.tampermonkey.net/), then open [the script](https://raw.githubusercontent.com/zhtinist/Bilimanga-Downloader/main/userscript/bilimanga.user.js) (Tampermonkey pops up the install page). Details in [`userscript/README.md`](userscript/README.md).
+> **One-click install:** get [Tampermonkey](https://www.tampermonkey.net/), then open the [Greasy Fork page](https://greasyfork.org/en/scripts/588995) and click "Install this script" (auto-updates). On the first download Tampermonkey asks for cross-origin permission — **click "Always allow"** (images are on a separate CDN subdomain). Details in [`userscript/README.md`](userscript/README.md).
 > The rest of this page documents the **CLI**.
 
 ## Demo (example: book 703《與妳相戀到生命盡頭》)

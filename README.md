@@ -15,7 +15,7 @@
 | 干活的 CPU | 你的电脑 | 你的电脑（脚本同源跑在你自己浏览器里） |
 
 > 油猴脚本**同源跑在 bilimanga 页面里**，直接复用你**已经过了 Cloudflare 的当前会话**，因此不用装任何环境、也没有跨域问题。停在某本漫画的主页/目录页时，页面**右侧会出现一个「⬇ 下载本书」小按钮**，点开直接选章 + 格式下载，免去粘贴链接与确认漫画两步。
-> **一键安装**：先装 [Tampermonkey](https://www.tampermonkey.net/) → 点 [安装脚本](https://raw.githubusercontent.com/zhtinist/Bilimanga-Downloader/main/userscript/bilimanga.user.js)（油猴会自动弹出安装页）。详见 [`userscript/README.md`](userscript/README.md)。以下为**命令行版**说明。
+> **一键安装**：先装 [Tampermonkey](https://www.tampermonkey.net/) → 打开 [Greasy Fork 脚本页](https://greasyfork.org/zh-CN/scripts/588995) 点「安装此脚本」（自动更新）。首次下载会弹一次跨域授权，**请点「始终允许」**（图片在独立图床子域）。详见 [`userscript/README.md`](userscript/README.md)。以下为**命令行版**说明。
 
 ## 运行示例（以 703《與妳相戀到生命盡頭》为例）
 
