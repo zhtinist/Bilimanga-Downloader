@@ -4,6 +4,10 @@
 // @version      1.0.0
 // @description  在 bilimanga 漫画页面里一键把整卷下载成 EPUB / PDF，无需安装 Python 环境。
 // @author       HTZHU
+// @license      MIT
+// @homepageURL  https://github.com/zhtinist/Bilimanga-Downloader
+// @supportURL   https://github.com/zhtinist/Bilimanga-Downloader/issues
+// @icon         https://www.bilimanga.net/favicon.ico
 // @match        https://www.bilimanga.net/*
 // @match        https://www.bilicomic.net/*
 // @match        https://www.linovelib.com/*

@@ -8,8 +8,15 @@ cookie，页面与图片都走同源请求，比外部工具更稳，也不需�
 
 ## 安装
 
-1. 先给 Chrome / Edge 安装 **Tampermonkey** 扩展（从对应浏览器的扩展商店搜索安装）。
-2. 打开脚本文件的 **raw 链接**（GitHub 上点开 `userscript/bilimanga.user.js` → 右上角 `Raw`）：
+先给 Chrome / Edge 安装 **Tampermonkey** 扩展（从对应浏览器的扩展商店搜索安装），然后二选一：
+
+**方式一：Greasy Fork（推荐，自动更新）**
+
+在 [Greasy Fork](https://greasyfork.org/zh-CN) 搜索「Bilimanga 漫画下载器」，进脚本页点「安装此脚本」。
+
+**方式二：GitHub raw 链接**
+
+1. 打开脚本文件的 **raw 链接**（GitHub 上点开 `userscript/bilimanga.user.js` → 右上角 `Raw`）：
 
    ```
    https://raw.githubusercontent.com/zhtinist/Bilimanga-Downloader/main/userscript/bilimanga.user.js
