@@ -14,6 +14,13 @@ import sys
 from pathlib import Path
 from typing import List, Optional
 
+# 统一 UTF-8：无论从哪个入口进来，都保证终端中文不乱码（Windows 尤其需要）。
+for _s in (sys.stdout, sys.stderr):
+    try:
+        _s.reconfigure(encoding="utf-8")  # type: ignore[attr-defined]
+    except Exception:
+        pass
+
 from .build_epub import build_epub
 from .build_pdf import build_pdf
 from .config import Config, TEMP_DOWNLOAD_DIR

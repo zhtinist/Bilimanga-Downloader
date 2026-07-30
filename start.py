@@ -17,6 +17,14 @@ import subprocess
 import sys
 from pathlib import Path
 
+# 统一 UTF-8：Windows 终端默认 GBK/cp1252 会让中文乱码。把标准输出/错误切到
+# UTF-8（Python 3.7+），并给子进程设 PYTHONUTF8，保证全程中文正常显示。
+for _s in (sys.stdout, sys.stderr):
+    try:
+        _s.reconfigure(encoding="utf-8")  # type: ignore[attr-defined]
+    except Exception:
+        pass
+
 ROOT = Path(__file__).resolve().parent
 SRC = ROOT / "src"                      # 源代码目录
 REQUIREMENTS = SRC / "requirements.txt"
@@ -99,8 +107,9 @@ def main():
     # 准备项目内 .venv
     py = ensure_local_venv()
 
-    # 用目标环境的 python 重新启动本程序(带重入标记)
-    env = dict(os.environ, **{READY_FLAG: "1"})
+    # 用目标环境的 python 重新启动本程序(带重入标记 + 强制 UTF-8，避免中文乱码)
+    env = dict(os.environ, **{READY_FLAG: "1", "PYTHONUTF8": "1",
+                              "PYTHONIOENCODING": "utf-8"})
     print(f"环境就绪，正在启动 …… (使用 {py})\n")
     proc = subprocess.run([py, str(ROOT / "start.py"), *args], env=env)
     return proc.returncode

@@ -1,7 +1,7 @@
-name: Build & Release
+name: Release (CLI)
 
-# 推送形如 v1.2.3 的 tag 时触发：分别在 macOS / Windows 上打包，
-# 产物压缩后作为 GitHub Release 附件发布。也可在 Actions 页手动触发。
+# 推送形如 v1.2.3 的 tag 时触发：打包命令行工具源码（含双击启动器），
+# 作为 GitHub Release 附件发布。纯 Python，无需为各平台单独编译。
 on:
   push:
     tags:
@@ -12,65 +12,31 @@ permissions:
   contents: write
 
 jobs:
-  build:
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: macos-latest
-            asset: Bilimanga-Downloader-macOS.zip
-          - os: windows-latest
-            asset: Bilimanga-Downloader-Windows.zip
-    runs-on: ${{ matrix.os }}
+  release:
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-
-      - name: Install deps
+      - name: Package CLI
         run: |
-          python -m pip install --upgrade pip
-          pip install pyinstaller
-          pip install -r src/requirements.txt
+          mkdir -p out/Bilimanga-Downloader
+          cp -r start.py src run.command run.bat README.md README.en.md out/Bilimanga-Downloader/
+          cd out
+          zip -ry ../Bilimanga-Downloader-CLI.zip Bilimanga-Downloader
 
-      - name: Build
-        run: python packaging/build.py
-
-      - name: Package (macOS)
-        if: runner.os == 'macOS'
-        run: |
-          cd dist
-          zip -ry ../${{ matrix.asset }} "Bilimanga-Downloader"
-
-      - name: Package (Windows)
-        if: runner.os == 'Windows'
-        run: Compress-Archive -Path dist/Bilimanga-Downloader/* -DestinationPath ${{ matrix.asset }}
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: ${{ matrix.asset }}
-          path: ${{ matrix.asset }}
-
-  release:
-    needs: build
-    runs-on: ubuntu-latest
-    if: startsWith(github.ref, 'refs/tags/')
-    steps:
-      - uses: actions/download-artifact@v4
-        with:
-          path: artifacts
       - name: Publish Release
         uses: softprops/action-gh-release@v2
         with:
-          files: artifacts/**/*.zip
+          files: Bilimanga-Downloader-CLI.zip
           generate_release_notes: true
           body: |
-            双击即用，无需本地 Python（漫画需本机已装 Chrome/Edge 以过 Cloudflare；轻小说走手机站直连，一般无需浏览器）。
+            纯 Python 命令行下载器（跨平台，无需编译）。
 
-            - macOS：下载 `Bilimanga-Downloader-macOS.zip`，解压后双击文件夹内的 `Bilimanga-Downloader`（会打开终端运行）。
-              首次打开若被 Gatekeeper 拦，在「系统设置 → 隐私与安全性」点「仍要打开」。
-            - Windows：下载 `Bilimanga-Downloader-Windows.zip`，解压后双击 `Bilimanga-Downloader.exe`。
+            **前置**：本机需装有 **Python 3.9+**；下载漫画还需 **Chrome / Edge**（过 Cloudflare 用）。
 
-            启动后在终端里交互：先选「漫画 / 轻小说」，输入链接或书号，方向键勾选要下的卷。下载目录默认系统下载文件夹 `~/Downloads`，可用 `--out` 指定。
+            **使用**：下载 `Bilimanga-Downloader-CLI.zip` 解压后——
+            - macOS：双击 `run.command`
+            - Windows：双击 `run.bat`
+            - 或在终端里执行：`python3 start.py`
+
+            首次运行会自动创建项目内 `.venv` 并安装依赖。进入后粘贴漫画或轻小说网址（自动识别类型），方向键勾选要下的卷即可。下载默认存到系统下载目录 `~/Downloads`，可用 `--out <目录>` 指定。

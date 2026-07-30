@@ -2,57 +2,57 @@
 
 **English** · [中文](README.md)
 
-Downloader for [bilimanga.net](https://www.bilimanga.net/) manga and [linovelib](https://www.linovelib.com)
-light novels, packaged per volume into **EPUB** or **PDF**.
+Downloader for [bilimanga.net](https://www.bilimanga.net/) manga and [bilinovel](https://www.bilinovel.com) light novels, packaged per volume into **EPUB** or **PDF**. A **pure-Python command-line tool** — cross-platform (macOS / Windows / Linux), no compilation needed.
 
-## Pick how to use it
+## Requirements
 
-| | ⭐ CLI / from source | Double-click executable | 🐵 Userscript |
-|---|---|---|---|
-| Best for | just use it / tweak code / automate | double-click to run | grab it inside the browser |
-| Get it | `python3 start.py` | download for your OS from [Releases](../../releases), double-click | install Tampermonkey → the script |
-| UI | terminal interface | native window | floating button on the page |
-| Status | recommended | on hold (macOS permission issues) | maintenance paused (fallback) |
+- **Python 3.9+**
+- For **manga**, a local **Chrome or Edge** is also required (to pass Cloudflare); light novels use a direct mobile-site connection and usually need no browser.
 
-CLI / from source is the recommended path; the double-click executable is on hold and the userscript is no longer
-maintained. **Chrome or Edge** must be installed.
-
-## CLI / from source
-
-No conda needed — `python3 start.py` creates a project-local `.venv` and installs dependencies automatically.
+## Quick start
 
 ```bash
-python3 start.py                            # open the terminal interface
-python3 start.py <link or id>               # download directly
-python3 start.py --out <dir> <link or id>   # output to a folder for this run
+python3 start.py                          # terminal interface
+python3 start.py <url-or-id>              # download directly
+python3 start.py --out <dir> <url-or-id>  # output to a specific dir
+python3 start.py --debug                   # verbose logging
 ```
 
-In the terminal interface: just paste a manga or novel URL (the type is auto-detected from the domain — no need to pick first; a bare book id will prompt once for the type), then select chapters interactively
-(arrow keys to tick or type a range); you can step back at any point.
+The first run **auto-creates a project-local `.venv` and installs deps** (no conda, no global pollution).
 
-- Manga: `https://www.bilimanga.net/detail/54.html` or id `54`
-- Novel: `https://www.linovelib.com/novel/2139.html`
+You can also **double-click to launch**:
 
-Files go to your Downloads folder (`~/Downloads`) by default; use `--out` to override.
+- macOS: double-click `run.command`
+- Windows: double-click `run.bat`
+
+> `run.bat` runs `chcp 65001` to switch the console to UTF-8, so Chinese text won't be garbled.
+
+## Usage
+
+In the terminal, just **paste a manga or novel URL** (detail or catalog page). The type is **auto-detected from the domain** — no need to pick first; a bare book id will prompt once for the type. Then select chapters interactively (arrow keys to check, or type a range like `1-9,15`); every step can go back.
+
+- Manga: `https://www.bilimanga.net/detail/703.html` or id `703`
+- Novel: `https://www.bilinovel.com/novel/2139.html` or id `2139`
+
+Downloads default to your system Downloads folder `~/Downloads`; use `--out` to change it. At the entry prompt, `s` opens settings and `q` quits.
 
 ## Settings
 
-- Output folder (defaults to Downloads, or set with `--out`)
-- Default format EPUB / PDF
+- Output directory (defaults to `~/Downloads`, or `--out`)
+- Default format EPUB / PDF (manga only; novels are always EPUB)
 - Proxy, rate-limit / backoff-retry / resume, debug logging
 
-Download threads auto-adjust (the terminal shows the live count). Novels default to a direct connection to the mobile
-site (faster) and fall back to the browser on errors; manga still needs a local Chrome / Edge (to pass Cloudflare).
+Thread count auto-tunes (the terminal shows the live count).
 
 ## Layout
 
 ```
 Bilimanga-Downloader/
-├── start.py              # entry (terminal interface)
-├── packaging/            # build script & GitHub Actions workflow
+├── start.py              # entry (terminal interface, auto .venv)
+├── run.command           # macOS double-click launcher
+├── run.bat               # Windows double-click launcher
 ├── src/bilimanga_dl/     # source
-├── userscript/           # 🐵 userscript build (maintenance paused)
-└── resource/             # cover image app_cover.png
+└── resource/             # assets
 ```
 
-> For personal study / backing up public content only. Please respect the site's terms.
+> For personal study and backup of public content only; please follow each site's terms.
