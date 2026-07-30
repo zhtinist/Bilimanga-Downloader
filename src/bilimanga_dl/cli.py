@@ -37,7 +37,7 @@ log = get_logger("cli")
 # 步骤机信号
 NEXT, GO_BACK, QUIT = "next", "back", "quit"
 
-STEPS = ["选类型", "输链接", "确认", "选章", "格式", "下载"]
+STEPS = ["输入网址", "确认", "选章", "格式", "下载"]
 
 
 # ---------------- 通用输出 ----------------
@@ -135,6 +135,7 @@ class _State:
         self.net: Optional[Net] = None            # 漫画/轻小说回退浏览器时用
         self.novel_engine = None                  # Mobile 或 NovelDownloader
         self.novel_via_browser = False
+        self.exit_app = False                     # 用户在入口选“退出”
 
     def ensure_net(self) -> Net:
         if self.net is None:
@@ -161,7 +162,8 @@ def _classify_input(raw: str, default_is_novel: bool):
 
     关键：**完整网址以域名为准**决定是漫画还是轻小说——
     ``bilinovel.com/novel/3`` 与 ``bilimanga.net/detail/3`` 是两本不同的书，
-    只靠书号会撞车。裸书号则沿用上一步所选类型。
+    只靠书号会撞车。裸书号无法从域名判断，返回的 ``is_novel`` 为
+    ``default_is_novel``（交互模式传 None，由调用方追问类型）。
     """
     from .novel import parse_novel_no
     s = (raw or "").strip()
@@ -185,65 +187,57 @@ def _classify_input(raw: str, default_is_novel: bool):
             "无法识别该网址属于哪个站点。请粘贴完整网址：\n"
             "  轻小说 https://www.bilinovel.com/novel/3.html\n"
             "  漫画   https://www.bilimanga.net/detail/703.html\n"
-            "或直接输入书号（按上一步所选类型处理）。")
+            "或直接输入书号。")
     # 非 URL 且非纯数字：按默认类型尽力解析
     return default_is_novel, (parse_novel_no(s) if default_is_novel else parse_book_no(s))
 
 
 # ---------------- 各步骤 ----------------
-def _step_kind(st: _State) -> str:
+def _step_input(st: _State) -> str:
+    """合并入口：粘贴任意网址自动识别漫画/轻小说；裸书号再快速追问类型。"""
     _clear()
     _breadcrumb(0)
-    choice = _ask_select(
-        "要下载什么？（↑↓ 移动，回车确认）",
-        ["📚 漫画（bilimanga.net）", "📖 轻小说（哔哩轻小说）", "⚙ 设置", "✖ 退出"],
-    )
-    if choice is None or choice.startswith("✖"):
-        return QUIT
-    if choice.startswith("⚙"):
-        open_settings(st.config, use_terminal=True)
-        _pause("\n按回车返回……")
-        return GO_BACK  # 重新进入本步
-    st.is_novel = choice.startswith("📖")
-    return NEXT
-
-
-def _step_input(st: _State) -> str:
-    _clear()
-    _breadcrumb(1, "轻小说" if st.is_novel else "漫画")
-    if st.is_novel:
-        _print("示例：轻小说链接 https://www.bilinovel.com/novel/2139.html 或书号 2139")
-    else:
-        _print("示例：漫画链接 https://www.bilimanga.net/detail/703.html 或书号 703")
-    _print("[dim]提示：不同站点的书号会撞车（如 novel/3 与 detail/3 不是同一本），"
-           "粘贴完整网址最稳妥。[/dim]")
-    raw = _ask_text("→ 粘贴完整网址或书号（b=返回）：")
+    _print("粘贴漫画或轻小说的网址（详情页 / 目录页），或输入书号，自动识别类型：")
+    _print("  漫画   https://www.bilimanga.net/detail/703.html")
+    _print("  轻小说 https://www.bilinovel.com/novel/2139.html")
+    _print("[dim]s=设置   q=退出[/dim]")
+    raw = _ask_text("→ 网址或书号：")
     if raw is None:
+        st.exit_app = True
         return QUIT
     raw = raw.strip()
-    if raw.lower() == "b":
+    if raw.lower() in ("q", "quit", "exit"):
+        st.exit_app = True
+        return QUIT
+    if raw.lower() in ("s", "设置", "setting", "settings"):
+        open_settings(st.config, use_terminal=True)
+        _pause("\n按回车返回……")
         return GO_BACK
     if not raw:
         _print("[yellow]未输入内容。[/yellow]")
         _pause("按回车重试……")
         return GO_BACK
     try:
-        is_novel, book_no = _classify_input(raw, st.is_novel)
+        is_novel, book_no = _classify_input(raw, default_is_novel=None)
     except ValueError as exc:
         _print(f"[red]{exc}[/red]")
         _pause("按回车重试……")
         return GO_BACK
-    if is_novel != st.is_novel:
-        kind = "轻小说" if is_novel else "漫画"
-        _print(f"[yellow]该网址属于{kind}站，已按{kind}处理。[/yellow]")
-        st.is_novel = is_novel
+    if is_novel is None:
+        # 裸书号无法从域名判断，快速追问一次
+        kind = _ask_select("这是漫画还是轻小说？（↑↓ 选择）",
+                           ["📚 漫画", "📖 轻小说", "← 重新输入"])
+        if kind is None or kind.startswith("←"):
+            return GO_BACK
+        is_novel = kind.startswith("📖")
+    st.is_novel = is_novel
     st.book_no = book_no
     return NEXT
 
 
 def _step_confirm(st: _State) -> str:
     _clear()
-    _breadcrumb(2, "轻小说" if st.is_novel else "漫画")
+    _breadcrumb(1, "轻小说" if st.is_novel else "漫画")
     _print("正在解析……（轻小说秒开；漫画首次需启动浏览器过 Cloudflare，约 10–20 秒）")
     book = _parse_book(st)
     if book is None:
@@ -265,7 +259,7 @@ def _step_confirm(st: _State) -> str:
 
 def _step_select(st: _State) -> str:
     _clear()
-    _breadcrumb(3, "轻小说" if st.is_novel else "漫画")
+    _breadcrumb(2, "轻小说" if st.is_novel else "漫画")
     result = pick_volumes(st.book.volumes, use_terminal=True)
     if result == BACK:
         return GO_BACK
@@ -282,7 +276,7 @@ def _step_format(st: _State) -> str:
         st.fmt = "epub"          # 轻小说固定 EPUB，自动跳过
         return NEXT
     _clear()
-    _breadcrumb(4, "漫画")
+    _breadcrumb(3, "漫画")
     choice = _ask_select(
         "输出格式（↑↓ 选择）：",
         ["epub（电子书阅读器）", "pdf（按原图整页排版）", "← 返回上一步"],
@@ -297,7 +291,7 @@ def _step_format(st: _State) -> str:
 
 def _step_download(st: _State) -> str:
     _clear()
-    _breadcrumb(5, "轻小说" if st.is_novel else "漫画")
+    _breadcrumb(4, "轻小说" if st.is_novel else "漫画")
     out_root = st.config.output_path()
     target = out_root / safe_name(st.book.title)
     target.mkdir(parents=True, exist_ok=True)
@@ -479,7 +473,7 @@ def _run_pipeline_with_progress(downloader: Downloader, book: Book, volumes,
 # ---------------- 步骤机驱动 ----------------
 def _run_flow(st: _State, start_at: int = 0) -> None:
     """从 start_at 步开始跑步骤机。下载完/退出后返回。"""
-    fns = [_step_kind, _step_input, _step_confirm, _step_select, _step_format, _step_download]
+    fns = [_step_input, _step_confirm, _step_select, _step_format, _step_download]
     i = start_at
     try:
         while 0 <= i < len(fns):
@@ -487,9 +481,9 @@ def _run_flow(st: _State, start_at: int = 0) -> None:
             if sig == NEXT:
                 i += 1
             elif sig == GO_BACK:
-                # 轻小说时“格式”步是自动跳过的，回退要多退一格
+                # 轻小说时“格式”步(索引 3)自动跳过，回退要多退一格
                 i -= 1
-                if i == 4 and st.is_novel:
+                if i == 3 and st.is_novel:
                     i -= 1
                 if i < start_at:
                     i = start_at
@@ -507,7 +501,7 @@ def run_download(config: Config, url_or_no: str) -> None:
     except ValueError as exc:
         _print(f"[red]{exc}[/red]")
         return
-    _run_flow(st, start_at=2)   # 从“确认”开始
+    _run_flow(st, start_at=1)   # 从“确认”开始
 
 
 # ---------------- 入口 ----------------
@@ -545,11 +539,10 @@ def main(argv: Optional[List[str]] = None) -> int:
         run_download(config, argv[0])
         return 0
 
-    # 无参数：循环进入步骤机（从选类型开始）
+    # 无参数：循环进入步骤机（从入口开始，一本下完再回到入口）
     while True:
         st = _State(config)
         _run_flow(st, start_at=0)
-        # 步骤机内 QUIT 会返回这里；“退出”选项直接结束
-        if st.is_novel is None:  # 用户在第 1 步选了退出
+        if st.exit_app:            # 用户在入口输入 q 退出
             _print("再见！")
             return 0

@@ -27,7 +27,7 @@ python3 start.py <link or id>               # download directly
 python3 start.py --out <dir> <link or id>   # output to a folder for this run
 ```
 
-In the terminal interface: first pick Manga / Novel, then enter a link or id, then select chapters interactively
+In the terminal interface: just paste a manga or novel URL (the type is auto-detected from the domain — no need to pick first; a bare book id will prompt once for the type), then select chapters interactively
 (arrow keys to tick or type a range); you can step back at any point.
 
 - Manga: `https://www.bilimanga.net/detail/54.html` or id `54`
