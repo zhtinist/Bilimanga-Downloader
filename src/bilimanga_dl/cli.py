@@ -1,9 +1,16 @@
-"""命令行主流程（纯命令行工具；图形界面见浏览器插件 crx/）。"""
+"""终端交互界面（唯一界面；无图形窗口）。
+
+设计：一个可前进/回退的**步骤机**，每步 ``console.clear()`` + 顶部面包屑，
+不再顺序刷屏。步骤：选类型 → 输链接 → 确认 → 选章 → 选格式 → 下载。
+
+- 漫画：bilimanga.net，真实浏览器过 Cloudflare（:class:`Net` + :class:`Scraper`）。
+- 轻小说：默认走**无浏览器手机站引擎**（:class:`MobileNovelDownloader`，快），
+  失败时自动回退浏览器引擎（:class:`NovelDownloader`）。
+"""
 
 from __future__ import annotations
 
 import sys
-import webbrowser
 from pathlib import Path
 from typing import List, Optional
 
@@ -15,218 +22,375 @@ from .logutil import debug_requested, get_logger, setup_logging
 from .models import Book
 from .net import Net
 from .scraper import Scraper, parse_book_no
-from .ui.picker import pick_volumes
+from .ui.picker import BACK, pick_volumes
 from .ui.settings import open_settings
 
 try:
     from rich.console import Console
-    from rich.progress import (BarColumn, Progress, TextColumn,
-                               TimeRemainingColumn)
+    from rich.progress import (BarColumn, Progress, SpinnerColumn, TextColumn)
     _console: Optional[Console] = Console()
 except Exception:  # rich 不是硬依赖
     _console = None
 
+log = get_logger("cli")
 
+# 步骤机信号
+NEXT, GO_BACK, QUIT = "next", "back", "quit"
+
+STEPS = ["选类型", "输链接", "确认", "选章", "格式", "下载"]
+
+
+# ---------------- 通用输出 ----------------
 def _print(msg: str = "") -> None:
     if _console:
         _console.print(msg)
     else:
-        # 去掉 rich 标记再打印
         import re
         print(re.sub(r"\[/?[a-z0-9 #]+\]", "", msg))
 
 
-def _rule(title: str) -> None:
+def _clear() -> None:
     if _console:
-        _console.rule(f"[bold cyan]{title}")
+        _console.clear()
+
+
+def _breadcrumb(cur: int, kind_label: str = "") -> None:
+    """顶部面包屑：已完成灰色、当前高亮、未到暗色。"""
+    parts = []
+    for i, name in enumerate(STEPS):
+        if i < cur:
+            parts.append(f"[dim]{i + 1}.{name}[/dim]")
+        elif i == cur:
+            parts.append(f"[bold cyan]➤ {i + 1}.{name}[/bold cyan]")
+        else:
+            parts.append(f"[grey37]{i + 1}.{name}[/grey37]")
+    head = "  ".join(parts)
+    if kind_label:
+        head = f"[bold]{kind_label}[/bold]   " + head
+    if _console:
+        _console.rule(head)
     else:
-        print("\n" + "=" * 4 + f" {title} " + "=" * 4)
+        print("\n" + " > ".join(STEPS) + f"  (当前: {STEPS[cur]})")
+    _print("[dim]提示：回车确认 · 输入 b 回上一步 · Ctrl-C 取消[/dim]\n")
 
 
-def _prompt(msg: str) -> str:
-    return input(msg)
+# ---------------- questionary 封装（无 TTY 退回 input）----------------
+def _tty() -> bool:
+    try:
+        return sys.stdin.isatty() and sys.stdout.isatty()
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _q():
+    if not _tty():
+        return None
+    try:
+        import questionary
+        return questionary
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _ask_select(msg: str, choices: List[str]) -> Optional[str]:
+    q = _q()
+    if q:
+        return q.select(msg, choices=choices).ask()
+    # 文本兜底
+    _print(msg)
+    for i, c in enumerate(choices, 1):
+        _print(f"  {i}) {c}")
+    ans = input("→ 请选择序号：").strip()
+    if ans.isdigit() and 1 <= int(ans) <= len(choices):
+        return choices[int(ans) - 1]
+    return None
+
+
+def _ask_text(msg: str) -> Optional[str]:
+    q = _q()
+    if q:
+        return q.text(msg).ask()
+    try:
+        return input(msg + " ")
+    except EOFError:
+        return None
+
+
+def _pause(msg: str = "按回车继续……") -> None:
+    try:
+        input(msg)
+    except EOFError:
+        pass
+
+
+# ---------------- 会话状态 ----------------
+class _State:
+    def __init__(self, config: Config):
+        self.config = config
+        self.is_novel: Optional[bool] = None
+        self.book_no: str = ""
+        self.book: Optional[Book] = None
+        self.selected: List[int] = []
+        self.fmt: str = "epub"
+        self.net: Optional[Net] = None            # 漫画/轻小说回退浏览器时用
+        self.novel_engine = None                  # Mobile 或 NovelDownloader
+        self.novel_via_browser = False
+
+    def ensure_net(self) -> Net:
+        if self.net is None:
+            self.net = Net(self.config)
+        return self.net
+
+    def close(self) -> None:
+        if self.net is not None:
+            try:
+                self.net.close()
+            except Exception:  # noqa: BLE001
+                pass
+            self.net = None
+        if self.novel_engine is not None and hasattr(self.novel_engine, "close"):
+            try:
+                self.novel_engine.close()
+            except Exception:  # noqa: BLE001
+                pass
 
 
 # ---------------- 各步骤 ----------------
-def choose_format(config: Config) -> str:
-    _rule("第 4 步 / 共 4 步：选择输出格式")
-    default = config.default_format
-    _print("可选格式：epub（电子书阅读器）/ pdf（通用，按原图整页排版）")
-    while True:
-        ans = _prompt(f"→ 输入 epub 或 pdf（直接回车用默认 {default}）：").strip().lower()
-        if not ans:
-            return default
-        if ans in ("epub", "pdf"):
-            return ans
-        _print("  请输入 epub 或 pdf。")
+def _step_kind(st: _State) -> str:
+    _clear()
+    _breadcrumb(0)
+    choice = _ask_select(
+        "要下载什么？（↑↓ 移动，回车确认）",
+        ["📚 漫画（bilimanga.net）", "📖 轻小说（哔哩轻小说）", "⚙ 设置", "✖ 退出"],
+    )
+    if choice is None or choice.startswith("✖"):
+        return QUIT
+    if choice.startswith("⚙"):
+        open_settings(st.config, use_terminal=True)
+        _pause("\n按回车返回……")
+        return GO_BACK  # 重新进入本步
+    st.is_novel = choice.startswith("📖")
+    return NEXT
 
 
-def run_download(config: Config, url_or_no: str) -> None:
-    # 输出目录：已配置用配置值，否则默认浏览器下载目录 ~/Downloads。
-    out_root = config.output_path()
-
-    from .novel import NovelDownloader, is_novel_url, parse_novel_no
-    net = Net(config)
-    scraper = Scraper(net)
-    is_novel = is_novel_url(url_or_no)
-
-    # 解析书号（本地，无需联网）
+def _step_input(st: _State) -> str:
+    _clear()
+    _breadcrumb(1, "轻小说" if st.is_novel else "漫画")
+    if st.is_novel:
+        _print("示例：轻小说链接 https://www.bilinovel.com/novel/2139.html 或书号 2139")
+    else:
+        _print("示例：漫画链接 https://www.bilimanga.net/detail/703.html 或书号 703")
+    raw = _ask_text("→ 粘贴链接或书号（b=返回）：")
+    if raw is None:
+        return QUIT
+    raw = raw.strip()
+    if raw.lower() == "b":
+        return GO_BACK
+    if not raw:
+        _print("[yellow]未输入内容。[/yellow]")
+        _pause("按回车重试……")
+        return GO_BACK
     try:
-        book_no = parse_novel_no(url_or_no) if is_novel else parse_book_no(url_or_no)
+        from .novel import parse_novel_no
+        st.book_no = parse_novel_no(raw) if st.is_novel else parse_book_no(raw)
     except ValueError as exc:
         _print(f"[red]{exc}[/red]")
-        net.close()
-        return
+        _pause("按回车重试……")
+        return GO_BACK
+    return NEXT
 
-    kind_label = "轻小说" if is_novel else "漫画"
-    _rule(f"第 1 步 / 共 4 步：确认{kind_label}")
-    if is_novel:
-        detail_url = f"https://www.linovelib.com/novel/{book_no}.html"
-    else:
-        detail_url = f"{config.site}/detail/{book_no}.html"
-    net.warm_up(detail_url)  # 后台启动 Chrome + 预过 Cloudflare，隐藏冷启动耗时
 
-    def _parse_book() -> Optional[Book]:
-        _print("正在解析……（首次需启动浏览器过 Cloudflare，约 10–20 秒，可加 --debug 看详情）")
-        try:
-            if is_novel:
-                b = NovelDownloader(net).fetch_book(book_no)
-            else:
-                b = scraper.fetch_book(book_no)
-        except Exception as exc:
-            _print(f"[red]获取书籍信息失败：{exc}[/red]")
-            return None
-        if not b.volumes:
-            _print("[red]未解析到任何章节/卷，可能是页面结构变化或该书需要登录。[/red]")
-            return None
-        return b
-
-    book: Optional[Book] = None
-    if config.confirm_open_browser:
-        # 弹网页核对：先秒开浏览器详情页，隐藏自动化浏览器冷启动耗时
-        try:
-            webbrowser.open(detail_url)
-            _print(f"  已在浏览器打开主页供你核对：{detail_url}")
-        except Exception:
-            _print(f"  主页：{detail_url}")
-    else:
-        # 不弹网页：先解析拿到书名，仅在命令行打印作品名字供核对
-        book = _parse_book()
-        if book is None:
-            net.close()
-            return
-        _print(f"  作品名字：[bold]{book.title}[/bold]　{book.author}　共 {len(book.volumes)} 章")
-
-    ans = _prompt("→ 是这本吗？回车/y 确认，n 取消：").strip().lower()
-    if ans not in ("", "y", "yes"):
-        _print("已取消。")
-        net.close()
-        return
-
-    # 第 2 步：解析目录（命令行核对模式已在上一步解析完成）
-    _rule("第 2 步 / 共 4 步：解析目录")
+def _step_confirm(st: _State) -> str:
+    _clear()
+    _breadcrumb(2, "轻小说" if st.is_novel else "漫画")
+    _print("正在解析……（轻小说秒开；漫画首次需启动浏览器过 Cloudflare，约 10–20 秒）")
+    book = _parse_book(st)
     if book is None:
-        book = _parse_book()
-        if book is None:
-            net.close()
-            return
-    _print(f"  [bold]{book.title}[/bold]　{book.author}　共 {len(book.volumes)} 章")
+        _print("[red]解析失败。可能是书号错误 / 网络问题 / 站点结构变化。[/red]")
+        _pause("按回车返回上一步……")
+        return GO_BACK
+    st.book = book
+    _print(f"\n  作品：[bold]{book.title}[/bold]")
+    _print(f"  作者：{book.author}    共 {len(book.volumes)} 卷")
+    if book.publisher:
+        _print(f"  文库：{book.publisher}")
+    ans = _ask_text("\n→ 是这本吗？回车/y 确认，n/b 返回：")
+    if ans is None:
+        return QUIT
+    if ans.strip().lower() in ("", "y", "yes"):
+        return NEXT
+    return GO_BACK
 
-    # 第 3 步（选章）
-    _rule("第 3 步 / 共 4 步：选择要下载的章")
-    selected = pick_volumes(book.volumes, use_terminal=True)
-    if not selected:
-        _print("未选择任何章，已取消。")
-        net.close()
-        return
 
-    # 第 4 步：格式（轻小说固定 EPUB）
-    fmt = "epub" if is_novel else choose_format(config)
+def _step_select(st: _State) -> str:
+    _clear()
+    _breadcrumb(3, "轻小说" if st.is_novel else "漫画")
+    result = pick_volumes(st.book.volumes, use_terminal=True)
+    if result == BACK:
+        return GO_BACK
+    if not result:
+        _print("[yellow]未选择任何卷。[/yellow]")
+        _pause("按回车返回……")
+        return GO_BACK
+    st.selected = result
+    return NEXT
 
-    target = out_root / safe_name(book.title)
+
+def _step_format(st: _State) -> str:
+    if st.is_novel:
+        st.fmt = "epub"          # 轻小说固定 EPUB，自动跳过
+        return NEXT
+    _clear()
+    _breadcrumb(4, "漫画")
+    choice = _ask_select(
+        "输出格式（↑↓ 选择）：",
+        ["epub（电子书阅读器）", "pdf（按原图整页排版）", "← 返回上一步"],
+    )
+    if choice is None:
+        return QUIT
+    if choice.startswith("←"):
+        return GO_BACK
+    st.fmt = "pdf" if choice.startswith("pdf") else "epub"
+    return NEXT
+
+
+def _step_download(st: _State) -> str:
+    _clear()
+    _breadcrumb(5, "轻小说" if st.is_novel else "漫画")
+    out_root = st.config.output_path()
+    target = out_root / safe_name(st.book.title)
     target.mkdir(parents=True, exist_ok=True)
-    _rule("开始下载（逐卷产出）")
-    _print(f"输出目录：[bold]{target}[/bold]")
-    index_map = {v.index: v for v in book.volumes}
-    volumes = [index_map[i] for i in selected]
+    _print(f"输出目录：[bold]{target}[/bold]\n")
 
-    outputs = []
-    interrupted = False
+    index_map = {v.index: v for v in st.book.volumes}
+    volumes = [index_map[i] for i in st.selected if i in index_map]
+
     try:
-        if is_novel:
-            outputs = _run_novel_download(net, book, volumes, target)
-            net.close()
-            _print(f"\n[bold green]全部完成，共 {len(outputs)} 个文件 → {target}[/bold green]")
-            return
-        downloader = Downloader(net, scraper, config)
-        build_fn = build_epub if fmt == "epub" else build_pdf
-        outputs = _run_pipeline_with_progress(
-            downloader, book, volumes, TEMP_DOWNLOAD_DIR, target, build_fn)
+        if st.is_novel:
+            outputs = _run_novel_progress(st.novel_engine, st.book, volumes, target)
+        else:
+            outputs = _run_manga(st, volumes, target)
     except KeyboardInterrupt:
-        interrupted = True
-        _print("\n[yellow]已中断下载，正在清理临时文件…[/yellow]")
+        _print("\n[yellow]已中断，清理临时文件…[/yellow]")
+        cleanup_book_temp(TEMP_DOWNLOAD_DIR, st.book.title)
+        _pause("按回车返回主菜单……")
+        return QUIT
     except Exception as exc:  # noqa: BLE001
-        interrupted = True
-        _print(f"\n[red]下载出错：{exc}，正在清理临时文件…[/red]")
-    finally:
-        # 无论正常/异常/中断：关闭浏览器释放内存，并清理该书临时图片。
-        net.close()
-        if interrupted:
-            cleanup_book_temp(TEMP_DOWNLOAD_DIR, book.title)
-        else:
-            # 正常结束：临时目录已在打包时逐卷删除，兜底清掉可能残留的空目录
-            book_temp = TEMP_DOWNLOAD_DIR / safe_name(book.title)
-            try:
-                if book_temp.exists() and not any(book_temp.iterdir()):
-                    book_temp.rmdir()
-            except OSError:
-                pass
+        _print(f"\n[red]下载出错：{exc}[/red]")
+        cleanup_book_temp(TEMP_DOWNLOAD_DIR, st.book.title)
+        _pause("按回车返回主菜单……")
+        return QUIT
 
-    if not interrupted:
-        _print(f"\n[bold green]全部完成，共 {len(outputs)} 个文件 → {target}[/bold green]")
+    _print(f"\n[bold green]✓ 全部完成，共 {len(outputs)} 个文件 → {target}[/bold green]")
+    _pause("\n按回车返回主菜单……")
+    return QUIT
 
 
-def _run_novel_download(net: Net, book: Book, volumes, out_dir):
-    """轻小说：逐卷抓文本+插图 → 文字型 EPUB。"""
-    from .novel import NovelDownloader
-    nd = NovelDownloader(net, num_thread=4)
-    outputs = []
-    for v in volumes:
-        _print(f"[cyan]⬇ 下载卷[/cyan] {v.index}. {v.title}")
+# ---------------- 解析 / 下载实现 ----------------
+def _parse_book(st: _State) -> Optional[Book]:
+    if st.is_novel:
+        return _parse_novel(st)
+    net = st.ensure_net()
+    try:
+        detail = f"{st.config.site}/detail/{st.book_no}.html"
+        net.warm_up(detail)
+        return Scraper(net).fetch_book(st.book_no)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("漫画解析失败：%s", exc)
+        return None
 
-        def on_phase(vi, ph):
-            label = {"download": "下载文本/插图", "package": "打包", "empty": "无内容"}.get(ph, ph)
-            _print(f"    {label}")
 
-        def on_concurrency(vi, n):
-            _print(f"    🧵 并发线程：{n}")
+def _parse_novel(st: _State) -> Optional[Book]:
+    # 优先无浏览器手机站引擎
+    from .novel_mobile import MobileNovelDownloader
+    try:
+        eng = MobileNovelDownloader(num_thread=4, proxy=st.config.proxy or "")
+        book = eng.fetch_book(st.book_no)
+        if book.volumes:
+            st.novel_engine = eng
+            st.novel_via_browser = False
+            return book
+    except Exception as exc:  # noqa: BLE001
+        log.warning("手机站引擎解析失败，回退浏览器：%s", exc)
+    # 回退：浏览器引擎（桌面站 linovelib）
+    try:
+        from .novel import NovelDownloader
+        net = st.ensure_net()
+        eng = NovelDownloader(net)
+        book = eng.fetch_book(st.book_no)
+        st.novel_engine = eng
+        st.novel_via_browser = True
+        return book
+    except Exception as exc:  # noqa: BLE001
+        log.warning("浏览器引擎也失败：%s", exc)
+        return None
 
-        path = nd.download_volume(book, v, out_dir, on_phase=on_phase,
-                                  on_concurrency=on_concurrency)
-        if path:
-            outputs.append(path)
-            _print(f"[green]✓ 完成[/green] {path.name}")
-        else:
-            _print(f"[yellow]⚠ 卷 {v.index} 无内容，跳过[/yellow]")
+
+def _run_novel_progress(engine, book: Book, volumes, target) -> List[Path]:
+    """逐卷进度条（手机站引擎与浏览器引擎接口一致，共用此函数）。"""
+    outputs: List[Path] = []
+    if _console:
+        with Progress(SpinnerColumn(), TextColumn("[progress.description]{task.description}"),
+                      BarColumn(), TextColumn("{task.completed}/{task.total}"),
+                      console=_console) as progress:
+            for v in volumes:
+                task = progress.add_task(f"⬇ {v.title}", total=None)
+
+                def on_total(vi, n, _t=task):
+                    progress.update(_t, total=max(n, 1))
+
+                def on_image(vi, _t=task):
+                    progress.advance(_t, 1)
+
+                def on_phase(vi, ph, _t=task, _v=v):
+                    label = {"download": "下载文本/插图", "package": "打包",
+                             "empty": "无内容"}.get(ph, ph)
+                    progress.update(_t, description=f"{label}  {_v.title}")
+
+                path = engine.download_volume(book, v, target, on_phase=on_phase,
+                                              on_total=on_total, on_image=on_image)
+                if path:
+                    outputs.append(path)
+                    progress.update(task, description=f"[green]✓ {path.name}[/green]")
+                else:
+                    progress.update(task, description=f"[yellow]⚠ 无内容 {v.title}[/yellow]")
+    else:
+        for v in volumes:
+            print(f"⬇ 下载卷 {v.index}. {v.title}", flush=True)
+            path = engine.download_volume(book, v, target)
+            print(f"  {'✓ ' + path.name if path else '⚠ 无内容'}", flush=True)
+            if path:
+                outputs.append(path)
     return outputs
+
+
+def _run_manga(st: _State, volumes, target) -> List[Path]:
+    net = st.ensure_net()
+    downloader = Downloader(net, Scraper(net), st.config)
+    build_fn = build_epub if st.fmt == "epub" else build_pdf
+    try:
+        return _run_pipeline_with_progress(
+            downloader, st.book, volumes, TEMP_DOWNLOAD_DIR, target, build_fn)
+    finally:
+        # 正常结束兜底清空可能残留的空临时目录
+        book_temp = TEMP_DOWNLOAD_DIR / safe_name(st.book.title)
+        try:
+            if book_temp.exists() and not any(book_temp.iterdir()):
+                book_temp.rmdir()
+        except OSError:
+            pass
 
 
 def _run_pipeline_with_progress(downloader: Downloader, book: Book, volumes,
                                 temp_dir, out_dir, build_fn):
-    """每个选中卷一条进度条：下载→校对→打包→✓完成（逐卷产出）。"""
+    """漫画：每个选中卷一条进度条：下载→校对→打包→✓完成。"""
     titles = {v.index: v.title for v in volumes}
-
     if _console:
-        from rich.progress import SpinnerColumn
-        with Progress(
-            SpinnerColumn(),
-            TextColumn("[progress.description]{task.description}"),
-            BarColumn(),
-            TextColumn("{task.completed}/{task.total}"),
-            console=_console,
-        ) as progress:
-            tasks = {v.index: progress.add_task(f"⏳ 等待  {v.title}", total=None,
-                                                start=False) for v in volumes}
+        with Progress(SpinnerColumn(), TextColumn("[progress.description]{task.description}"),
+                      BarColumn(), TextColumn("{task.completed}/{task.total}"),
+                      console=_console) as progress:
+            tasks = {v.index: progress.add_task(f"⏳ 等待  {v.title}", total=None, start=False)
+                     for v in volumes}
             conc_task = progress.add_task("🧵 并发线程：4", total=1, completed=0)
 
             def on_concurrency(n):
@@ -267,33 +431,60 @@ def _run_pipeline_with_progress(downloader: Downloader, book: Book, volumes,
         def on_done(vidx, path):
             print(f"✓ 完成 卷{vidx}：{path.name if path else '无内容'}", flush=True)
 
-        def on_concurrency(n):
-            print(f"🧵 并发线程：{n}", flush=True)
-
-        return downloader.run_pipeline(
-            book, volumes, temp_dir, out_dir, build_fn,
-            on_start=on_start, on_done=on_done, on_concurrency=on_concurrency)
+        return downloader.run_pipeline(book, volumes, temp_dir, out_dir, build_fn,
+                                       on_start=on_start, on_done=on_done)
 
 
+# ---------------- 步骤机驱动 ----------------
+def _run_flow(st: _State, start_at: int = 0) -> None:
+    """从 start_at 步开始跑步骤机。下载完/退出后返回。"""
+    fns = [_step_kind, _step_input, _step_confirm, _step_select, _step_format, _step_download]
+    i = start_at
+    try:
+        while 0 <= i < len(fns):
+            sig = fns[i](st)
+            if sig == NEXT:
+                i += 1
+            elif sig == GO_BACK:
+                # 轻小说时“格式”步是自动跳过的，回退要多退一格
+                i -= 1
+                if i == 4 and st.is_novel:
+                    i -= 1
+                if i < start_at:
+                    i = start_at
+            else:  # QUIT
+                return
+    finally:
+        st.close()
+
+
+def run_download(config: Config, url_or_no: str) -> None:
+    """命令行直接下载：自动判类型，从“确认”步进入交互流程。"""
+    from .novel import is_novel_url, parse_novel_no
+    st = _State(config)
+    st.is_novel = is_novel_url(url_or_no)
+    try:
+        st.book_no = parse_novel_no(url_or_no) if st.is_novel else parse_book_no(url_or_no)
+    except ValueError as exc:
+        _print(f"[red]{exc}[/red]")
+        return
+    _run_flow(st, start_at=2)   # 从“确认”开始
+
+
+# ---------------- 入口 ----------------
 def _print_help() -> None:
     _print("用法：")
-    _print("  python3 start.py                启动原生图形界面（独立窗口）")
-    _print("  python3 start.py --cli          进入交互式命令行菜单")
-    _print("  python3 start.py <URL>          直接下载指定漫画")
-    _print("  python3 start.py --debug        开启调试日志")
-    _print("  python3 start.py --out <目录>   本次输出到指定目录（不写回设置）")
-    _print("  下载输出目录默认用浏览器下载目录 ~/Downloads，可在「设置」里修改。")
-    _print("  输入支持三种：详情页链接 / 目录页链接 / 书号，例如：")
-    _print("    python3 start.py https://www.bilimanga.net/detail/703.html")
-    _print("    python3 start.py https://www.bilimanga.net/read/703/catalog")
-    _print("    python3 start.py 703")
+    _print("  python3 start.py                进入终端交互界面")
+    _print("  python3 start.py <链接或书号>     直接下载")
+    _print("  python3 start.py --out <目录>    本次输出到指定目录")
+    _print("  python3 start.py --debug         开启调试日志")
+    _print("  输入支持：详情页链接 / 目录页链接 / 书号。")
 
 
 def main(argv: Optional[List[str]] = None) -> int:
     argv = argv if argv is not None else sys.argv[1:]
     config = Config.load()
 
-    # 调试日志：命令行 --debug / 环境变量 / 配置任一开启即生效
     debug_on = debug_requested(config.debug)
     log_path = setup_logging(debug_on)
     if debug_on:
@@ -302,49 +493,24 @@ def main(argv: Optional[List[str]] = None) -> int:
     if "--help" in argv or "-h" in argv:
         _print_help()
         return 0
-    # --out <目录>：本次运行临时指定输出目录（不写回设置）
     if "--out" in argv:
         i = argv.index("--out")
         if i + 1 < len(argv):
             config.output_dir = argv[i + 1]
             del argv[i:i + 2]
 
-    force_cli = "--cli" in argv
-    # 去掉开关参数，剩下的第一个非开关项当作 URL
     argv = [a for a in argv if a not in ("--debug", "--cli", "--ui")]
 
-    # 命令行：带 URL 参数直接下载
+    # 带 URL 参数：直接下载
     if argv:
         run_download(config, argv[0])
         return 0
 
-    # 无 URL 参数：默认启动原生图形界面；--cli 才进终端菜单
-    if not force_cli:
-        try:
-            from .gui import run as gui_run
-            return gui_run(config)
-        except Exception as exc:  # noqa: BLE001 —— 无显示环境等，退回终端菜单
-            _print(f"[yellow]图形界面无法启动（{exc}），改用命令行菜单。[/yellow]")
-
-    # 交互式菜单
+    # 无参数：循环进入步骤机（从选类型开始）
     while True:
-        _rule("bilimanga.net 漫画下载器")
-        _print("  1) 下载漫画")
-        _print("  2) 设置")
-        _print("  3) 退出")
-        choice = _prompt("→ 请选择 [1]：").strip() or "1"
-        if choice == "1":
-            _print("支持以下任一输入（三选一）：")
-            _print("  · 详情页链接：https://www.bilimanga.net/detail/703.html")
-            _print("  · 目录页链接：https://www.bilimanga.net/read/703/catalog")
-            _print("  · 漫画书号：  703")
-            url = _prompt("→ 请粘贴链接或书号：").strip()
-            if url:
-                run_download(config, url)
-        elif choice == "2":
-            open_settings(config, use_terminal=True)
-        elif choice in ("3", "q", "quit", "exit"):
+        st = _State(config)
+        _run_flow(st, start_at=0)
+        # 步骤机内 QUIT 会返回这里；“退出”选项直接结束
+        if st.is_novel is None:  # 用户在第 1 步选了退出
             _print("再见！")
             return 0
-        else:
-            _print("无效选择，请输入 1 / 2 / 3。")

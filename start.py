@@ -1,34 +1,28 @@
 #!/usr/bin/env python3
-"""一键启动:自建独立 conda 环境 → 装依赖到该环境 → 进入下载器。
+"""一键启动:自建项目内 .venv → 装依赖到该环境 → 进入下载器。
 
 设计原则:
-- **绝不往系统/base 环境装库**。所有依赖装进独立 conda 环境
-  ``bilimanga-dl``;没有 conda 时退回项目内 ``.venv``(仍不污染全局)。
+- **绝不往系统/全局环境装库**。所有依赖装进项目内 ``.venv``,不污染全局。
 - 命令行只负责"准备环境 + 启动"这一步。
 
 用法:
-    python3 start.py                 # 准备环境并启动原生图形界面(独立窗口)
-    python3 start.py --cli           # 交互式命令行菜单
-    python3 start.py <URL>           # 直接下载指定漫画
-    python3 start.py --debug         # 开调试日志
-
-默认启动原生图形界面(Tkinter 独立窗口,不开浏览器、不起本地服务);加 --cli 走纯命令行。
+    python3 start.py                 # 进入终端交互界面
+    python3 start.py <链接或书号>     # 直接下载
+    python3 start.py --debug         # 调试日志
+    python3 start.py --out <目录>    # 本次输出目录
 """
 
 import os
-import shutil
 import subprocess
 import sys
 from pathlib import Path
 
-ENV_NAME = "bilimanga-dl"
-PY_VERSION = "3.11"
 ROOT = Path(__file__).resolve().parent
 SRC = ROOT / "src"                      # 源代码目录
 REQUIREMENTS = SRC / "requirements.txt"
 IMPORT_CHECK = [
     "requests", "bs4", "lxml", "rich", "DrissionPage",
-    "ebooklib", "img2pdf", "PIL", "pillow_avif",
+    "ebooklib", "img2pdf", "PIL", "pillow_avif", "questionary",
 ]
 # 已在目标环境里(重入标记),直接跑主程序,避免无限套娃
 READY_FLAG = "BILIMANGA_ENV_READY"
@@ -39,45 +33,12 @@ def _run(cmd, **kw):
     return subprocess.run(cmd, check=True, **kw)
 
 
-# ---------- conda ----------
-def find_conda():
-    exe = shutil.which("conda")
-    if exe:
-        return exe
-    for base in (Path.home() / "miniconda3", Path.home() / "anaconda3",
-                 Path.home() / "miniforge3", Path("/opt/miniconda3"),
-                 Path("/opt/anaconda3")):
-        for sub in ("condabin/conda", "bin/conda",
-                    "Scripts/conda.exe", "condabin/conda.bat"):
-            p = base / sub
-            if p.exists():
-                return str(p)
-    return None
-
-
-def conda_env_python(conda):
-    base = subprocess.check_output([conda, "info", "--base"], text=True).strip()
-    env_dir = Path(base) / "envs" / ENV_NAME
-    if os.name == "nt":
-        return env_dir / "python.exe", env_dir
-    return env_dir / "bin" / "python", env_dir
-
-
-def ensure_conda_env(conda):
-    py, env_dir = conda_env_python(conda)
-    if not env_dir.exists():
-        print(f"未找到 conda 环境 {ENV_NAME}，正在创建（python={PY_VERSION}）……")
-        _run([conda, "create", "-y", "-n", ENV_NAME, f"python={PY_VERSION}"])
-    ensure_deps(str(py))
-    return str(py)
-
-
-# ---------- venv 回退 ----------
+# ---------- venv ----------
 def ensure_local_venv():
     venv_dir = ROOT / ".venv"
     py = (venv_dir / ("Scripts/python.exe" if os.name == "nt" else "bin/python"))
     if not py.exists():
-        print("未检测到 conda，改用项目内 .venv（不污染全局）……")
+        print("正在创建项目内 .venv（不污染全局）……")
         _run([sys.executable, "-m", "venv", str(venv_dir)])
     ensure_deps(str(py))
     return str(py)
@@ -108,7 +69,7 @@ def _pip_install(py, args, use_mirror=False):
 def ensure_deps(py):
     if deps_ok(py):
         return
-    print("正在向独立环境安装依赖(首次运行较慢，请稍候)……")
+    print("正在向 .venv 安装依赖(首次运行较慢，请稍候)……")
     # pip 自升级失败不致命，忽略即可
     try:
         _pip_install(py, ["--upgrade", "pip"])
@@ -135,9 +96,8 @@ def main():
         from bilimanga_dl.cli import main as cli_main
         return cli_main(args)
 
-    # 准备独立环境
-    conda = find_conda()
-    py = ensure_conda_env(conda) if conda else ensure_local_venv()
+    # 准备项目内 .venv
+    py = ensure_local_venv()
 
     # 用目标环境的 python 重新启动本程序(带重入标记)
     env = dict(os.environ, **{READY_FLAG: "1"})
