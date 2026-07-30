@@ -161,6 +161,8 @@ class DownloaderGUI:
 
         top = self._frame(self.root)
         top.pack(fill="x", padx=16, pady=(14, 6))
+        self.logo_holder = self._frame(top)   # 封面缩略图（若有）挂这里
+        self.logo_holder.pack(side="left")
         self._label(top, "bilimanga 漫画下载器", font=FONT_TITLE).pack(side="left")
         self.nav_btn = ttk.Button(top, text="⚙ 设置", style="Ghost.TButton",
                                   command=self._nav_click)
@@ -265,11 +267,19 @@ class DownloaderGUI:
             row=4, column=0, columnspan=3, sticky="w", padx=8, pady=(2, 4))
         self._label(f, "下载线程数自动调节（4 起步），无需设置。",
                     fg=MUTED, font=FONT_SM).grid(row=5, column=0, columnspan=3, sticky="w",
-                                                 padx=8, pady=(0, 12))
+                                                 padx=8, pady=(0, 4))
+        # 轻小说需要登录 linovelib 才能读正文：一次性登录，登录态会被记住。
+        loginrow = self._frame(f)
+        loginrow.grid(row=6, column=0, columnspan=3, sticky="ew", padx=8, pady=(2, 10))
+        loginrow.columnconfigure(0, weight=1)
+        self._label(loginrow, "轻小说需登录 linovelib（漫画不需要）：",
+                    fg=MUTED, font=FONT_SM).grid(row=0, column=0, sticky="w")
+        self.btn_login = ttk.Button(loginrow, text="登录轻小说", command=self._login_novel)
+        self.btn_login.grid(row=0, column=1, sticky="e")
         self._refresh_hint()
 
         ttk.Button(f, text="保存设置", style="Accent.TButton", command=self._save_cfg).grid(
-            row=6, column=0, columnspan=3, sticky="e", pady=(6, 0), padx=8)
+            row=7, column=0, columnspan=3, sticky="e", pady=(6, 0), padx=8)
 
     def _build_progress(self):
         f = self.progress
@@ -360,6 +370,31 @@ class DownloaderGUI:
             self._refresh_hint()
             self._show("home")
 
+    def _finish_login(self):
+        try:
+            if self.net:
+                self.net.finish_login()
+        except Exception:  # noqa: BLE001
+            pass
+        self.msgq.put(("login_done",))
+
+    def _login_novel(self):
+        if self.busy:
+            return
+        self.busy = True
+        self.btn_login.configure(state="disabled", text="打开中…")
+        self._apply_cfg()
+
+        def worker():
+            try:
+                self._ensure_net()
+                self.net.open_login("https://www.linovelib.com/")
+                self.msgq.put(("login_opened",))
+            except Exception as exc:  # noqa: BLE001
+                self.msgq.put(("login_err", str(exc)))
+
+        threading.Thread(target=worker, daemon=True).start()
+
     # ---------------- 解析 ----------------
     def _on_parse(self):
         if self.busy:
@@ -377,12 +412,15 @@ class DownloaderGUI:
 
     def _parse_worker(self, text: str):
         try:
-            book_no = parse_book_no(text)
+            from .novel import NovelDownloader, is_novel_url, parse_novel_no
             self._reset_net()
             self._ensure_net()
-            book = self.scraper.fetch_book(book_no)
+            if is_novel_url(text):
+                book = NovelDownloader(self.net).fetch_book(parse_novel_no(text))
+            else:
+                book = self.scraper.fetch_book(parse_book_no(text))
             if not book.volumes:
-                raise RuntimeError("未解析到任何章节，可能页面结构变化或该书需登录。")
+                raise RuntimeError("未解析到任何章节/卷，可能页面结构变化或该书需登录。")
             self.msgq.put(("parse_done", book))
         except Exception as exc:  # noqa: BLE001
             self.msgq.put(("parse_err", str(exc)))
@@ -438,12 +476,28 @@ class DownloaderGUI:
     def _download_worker(self, vols, out_root):
         book = self.book
         target = out_root / safe_name(book.title)
+        q = self.msgq
         try:
             target.mkdir(parents=True, exist_ok=True)
             self._ensure_net()
+
+            # 轻小说：文字型 EPUB，逐卷产出（不走漫画图片流水线）
+            if book.kind == "novel":
+                from .novel import NovelDownloader
+                nd = NovelDownloader(self.net, num_thread=4)
+                for v in vols:
+                    q.put(("v_phase", v.index, "download"))
+                    path = nd.download_volume(
+                        book, v, target,
+                        on_phase=lambda vi, ph: q.put(("v_phase", vi, ph)),
+                        on_total=lambda vi, n: q.put(("v_total", vi, n)),
+                        on_image=lambda vi: q.put(("v_image", vi)))
+                    q.put(("v_done", v.index, path.name if path else ""))
+                q.put(("all_done", str(target)))
+                return
+
             downloader = Downloader(self.net, self.scraper, self.config)
             build_fn = build_epub if self.config.default_format == "epub" else build_pdf
-            q = self.msgq
             downloader.run_pipeline(
                 book, vols, TEMP_DOWNLOAD_DIR, target, build_fn,
                 on_start=lambda vi: q.put(("v_phase", vi, "download")),
@@ -485,6 +539,20 @@ class DownloaderGUI:
             self._set_prog(msg[1], phase=msg[2])
         elif kind == "v_done":
             self._set_prog(msg[1], phase="done" if msg[2] else "empty", name=msg[2])
+        elif kind == "login_opened":
+            self.busy = False
+            self.btn_login.configure(state="normal", text="登录轻小说")
+            messagebox.showinfo(
+                "登录轻小说",
+                "已打开浏览器窗口，请在其中登录 linovelib（哔哩轻小说）。\n"
+                "登录成功后回到这里点“确定”，程序会记住登录状态，之后下载全程无需再登录。")
+            threading.Thread(target=self._finish_login, daemon=True).start()
+        elif kind == "login_err":
+            self.busy = False
+            self.btn_login.configure(state="normal", text="登录轻小说")
+            messagebox.showerror("登录失败", msg[1])
+        elif kind == "login_done":
+            self.var_hint.set("✅ 轻小说登录已保存，可直接下载。")
         elif kind == "concurrency":
             self.var_conc.set(f"🧵 并发线程：{msg[1]}")
         elif kind == "all_done":
@@ -548,6 +616,39 @@ class DownloaderGUI:
         self.root.destroy()
 
 
+def _cover_path() -> Optional[Path]:
+    """定位封面图 resource/app_cover.png：源码运行在仓库内，打包后在解包目录。"""
+    import sys
+    candidates = []
+    if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
+        candidates.append(Path(sys._MEIPASS) / "resource" / "app_cover.png")
+    candidates.append(Path(__file__).resolve().parents[2] / "resource" / "app_cover.png")
+    for c in candidates:
+        if c.exists():
+            return c
+    return None
+
+
+def _apply_cover(gui: "DownloaderGUI") -> None:
+    """有封面图则：标题左侧显示缩略图 + 设为窗口/程序图标。"""
+    p = _cover_path()
+    if not p:
+        return
+    try:
+        from PIL import Image, ImageTk
+        with Image.open(p) as im:
+            im = im.convert("RGBA")
+            icon = im.resize((256, 256))
+            thumb = im.resize((34, 34))
+        gui._icon_img = ImageTk.PhotoImage(icon)
+        gui._logo_img = ImageTk.PhotoImage(thumb)
+        gui.root.iconphoto(True, gui._icon_img)
+        lbl = tk.Label(gui.logo_holder, image=gui._logo_img, bg=BG)
+        lbl.pack(side="left", padx=(0, 8))
+    except Exception as exc:  # noqa: BLE001
+        log.debug("加载封面图失败(忽略): %s", exc)
+
+
 def _force_repaint(root: tk.Tk) -> None:
     """修复 macOS(尤其旧 Tk 8.5)首次打开窗口内容空白、不重绘的老问题。"""
     try:
@@ -566,7 +667,8 @@ def _force_repaint(root: tk.Tk) -> None:
 
 def run(config: Config) -> int:
     root = tk.Tk()
-    DownloaderGUI(root, config)
+    gui = DownloaderGUI(root, config)
+    _apply_cover(gui)
     root.after(120, lambda: _force_repaint(root))
     root.mainloop()
     return 0

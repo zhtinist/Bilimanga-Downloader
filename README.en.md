@@ -59,6 +59,18 @@ conda is absent — neither pollutes your system), installs deps, then starts.
 The CLI download is 4 steps: **confirm → parse catalog → pick chapters (e.g. `1-9,15,20-25`, Enter = all)
 → pick format**, then a pipeline produces one volume at a time.
 
+## Light novels (linovelib)
+
+Besides manga, it also downloads **light novels** from [linovelib](https://www.linovelib.com), packaged as
+text EPUBs (prose + inline illustrations, with automatic font de-obfuscation). Usage: **paste a novel URL**
+(e.g. `https://www.linovelib.com/novel/2139.html`) and click Parse — the type (manga vs novel) is detected
+from the URL.
+
+> ⚠️ linovelib now **requires login** to read chapter text. Before your first novel download, click
+> Settings → "登录轻小说" once; a browser window opens for you to log in. The session is remembered (stored
+> in a dedicated browser profile), so subsequent downloads need no login and pop no window. Manga
+> (bilimanga) needs no login.
+
 ## Settings
 
 In the GUI "① Settings" panel, or `--cli` → Settings:

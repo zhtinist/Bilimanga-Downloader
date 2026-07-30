@@ -100,6 +100,14 @@ def _html_state(html: str) -> str:
     return "ok"
 
 
+def _free_port() -> int:
+    """取一个空闲本地端口给 Chrome 调试用（避免与已开浏览器/上次实例冲突）。"""
+    import socket
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
 def _detect_browser_path() -> Optional[str]:
     """跨平台探测常见 Chrome / Edge 安装路径。"""
     candidates = []
@@ -207,6 +215,7 @@ class BrowserEngine:
         self._pool_lock = threading.Lock()
         self._tab_count = 0
         self._max_tabs = max(1, config.parallel_chapters)  # 标签上限=并发上限
+        self._force_headful = False   # 登录时临时用有头浏览器
 
     def _ensure(self):
         if self._tab is not None:
@@ -224,15 +233,26 @@ class BrowserEngine:
                 "未找到本地 Chrome/Edge 浏览器。请安装 Chrome，或在设置里填 browser_path。"
             )
         co = ChromiumOptions().set_browser_path(browser_path)
-        co.auto_port()  # 每次用独立端口/用户目录，避免与已开的 Chrome 冲突
-        if self.config.browser_headless:
+        # 固定的独立用户资料目录：持久化登录态与 cf_clearance（下次更快；轻小说登录一次即可）。
+        # 注意不能用 auto_port()——它会另配临时资料目录，且与 set_user_data_path 叠加会清掉端口。
+        # 因此这里显式指定一个空闲端口 + 固定资料目录。
+        try:
+            from .config import PROJECT_ROOT
+            profile = PROJECT_ROOT / "browser_profile"
+            profile.mkdir(parents=True, exist_ok=True)
+            co.set_user_data_path(str(profile))
+        except Exception as exc:  # noqa: BLE001
+            log.debug("设置持久化用户目录失败(忽略): %s", exc)
+        co.set_local_port(_free_port())
+        headless = self.config.browser_headless and not self._force_headful
+        if headless:
             co.headless(True)
         co.set_argument("--no-first-run")
         co.set_argument("--no-default-browser-check")
         # 网络：不做任何特别设置，浏览器沿用它自身/系统的网络环境即可
         # （不 set_proxy、不 --no-proxy-server，实测这样最快且最稳）。
         log.info("正在启动本地浏览器过 Cloudflare（%s，headless=%s）……",
-                 browser_path, self.config.browser_headless)
+                 browser_path, headless)
         self._browser = Chromium(co)
         self._tab = self._browser.latest_tab
 
@@ -303,6 +323,74 @@ class BrowserEngine:
             return html
         finally:
             self._release(tab)
+
+    def get_novel_html(self, url: str) -> str:
+        """轻小说阅读页专用：过 CF + 等正文渲染，并按参考项目做“诱饵段落”清理。
+
+        linovelib 会注入一批 ``position:absolute`` 的假 ``<p>``（带 data-* 属性）来污染
+        抓取。这些只能靠**真实浏览器的计算样式**识别：找到定位为 absolute 的 p，取其
+        data-* 键值，把所有同键值的 p 从 DOM 里删掉；再清掉残留 data-* 属性。
+        """
+        from bs4 import BeautifulSoup
+        tab = self._borrow()
+        try:
+            tab.get(url)
+            deadline = time.time() + self.config.cloudflare_wait
+            html = tab.html or ""
+            state = _html_state(html)
+            while state == "challenge" and time.time() < deadline:
+                time.sleep(1.0)
+                html = tab.html or ""
+                state = _html_state(html)
+            if state == "blocked":
+                raise CloudflareBlocked(f"该 IP 被 Cloudflare 硬封禁: {url}")
+            if state == "challenge":
+                raise CloudflareBlocked(f"等待 {self.config.cloudflare_wait}s 仍未通过 Cloudflare: {url}")
+            # 等正文容器渲染 + 给 JS 一点注入时间
+            wd = time.time() + 15
+            while "TextContent" not in (tab.html or "") and time.time() < wd:
+                time.sleep(0.5)
+            time.sleep(2.0)
+            html = tab.html or ""
+            bf = BeautifulSoup(html, "html.parser")
+            # ① 用计算样式找诱饵 p，按 data-* 键值批量删除
+            try:
+                for p in tab.eles("tag:p"):
+                    try:
+                        if p.style("position") == "absolute":
+                            for k, v in (p.attrs or {}).items():
+                                if k.startswith("data-"):
+                                    for dp in bf.find_all("p", {k: v}):
+                                        dp.decompose()
+                    except Exception:
+                        continue
+            except Exception:
+                pass
+            # ② 清掉所有残留 data-* 属性
+            for p in bf.find_all("p"):
+                for k in [k for k in list(p.attrs) if k.startswith("data-")]:
+                    del p[k]
+            return str(bf)
+        finally:
+            self._release(tab)
+
+    def open_login(self, url: str) -> None:
+        """打开**有头**浏览器到登录页，供用户手动登录（登录态写入持久化资料目录）。"""
+        self.close()                 # 关掉当前(可能无头)实例
+        self._force_headful = True
+        self._ensure_pool()
+        tab = self._borrow()
+        try:
+            tab.get(url)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("打开登录页失败: %s", exc)
+        finally:
+            self._release(tab)
+
+    def finish_login(self) -> None:
+        """结束登录：关掉有头浏览器（Chrome 会把 cookie 落盘到资料目录），恢复无头。"""
+        self.close()
+        self._force_headful = False
 
     def prewarm(self, url: Optional[str] = None) -> None:
         """后台预热：启动浏览器 + 预先过一次 Cloudflare，隐藏冷启动耗时。"""
@@ -562,6 +650,15 @@ class Net:
             return
         threading.Thread(target=self.browser.prewarm, args=(url,), daemon=True).start()
 
+    def open_login(self, url: str) -> None:
+        """打开有头浏览器让用户登录（轻小说站点需要）。无浏览器模式下无操作。"""
+        if self.browser:
+            self.browser.open_login(url)
+
+    def finish_login(self) -> None:
+        if self.browser:
+            self.browser.finish_login()
+
     def resolve_base_url(self) -> str:
         if self.base_url:
             return self.base_url
@@ -585,6 +682,14 @@ class Net:
                  wait_for: Optional[str] = None) -> str:
         if self.browser:
             return self.browser.get_html(url, wait_for=wait_for)
+        resp = self._requests_fetch(url, referer=referer)
+        resp.encoding = resp.apparent_encoding or "utf-8"
+        return resp.text
+
+    def get_novel_text(self, url: str, *, referer: Optional[str] = None) -> str:
+        """轻小说阅读页 HTML（浏览器模式做诱饵段落清理；无浏览器时退回纯 requests）。"""
+        if self.browser:
+            return self.browser.get_novel_html(url)
         resp = self._requests_fetch(url, referer=referer)
         resp.encoding = resp.apparent_encoding or "utf-8"
         return resp.text

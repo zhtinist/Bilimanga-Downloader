@@ -8,6 +8,7 @@ __pycache__/
 /logs/
 /downloads/
 /temp/
+/browser_profile/
 crash.log
 
 # 打包产物（PyInstaller）

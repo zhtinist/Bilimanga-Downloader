@@ -30,6 +30,29 @@ ENTRY = ROOT / "packaging" / "app_entry.py"
 NAME = "Bilimanga-Downloader"
 
 
+def _make_icon(cover: Path):
+    """把封面 PNG 转成平台图标：Windows→.ico，macOS→.icns。失败则返回 None（不影响打包）。"""
+    try:
+        from PIL import Image
+        out_dir = ROOT / "build"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        img = Image.open(cover).convert("RGBA")
+        if sys.platform.startswith("win"):
+            ico = out_dir / "app.ico"
+            img.save(ico, sizes=[(16, 16), (32, 32), (48, 48), (64, 64), (128, 128), (256, 256)])
+            return ico
+        if sys.platform == "darwin":
+            icns = out_dir / "app.icns"
+            try:
+                img.save(icns)   # Pillow 在 macOS 上可写 icns
+                return icns
+            except Exception:
+                return None
+        return None
+    except Exception:
+        return None
+
+
 def main() -> int:
     try:
         import PyInstaller.__main__  # noqa: F401
@@ -66,6 +89,15 @@ def main() -> int:
         "--hidden-import", "bs4",
         "--hidden-import", "lxml",
     ]
+    # 封面图：随包内置（供 GUI 显示 + 窗口图标），并尽量转成可执行文件图标。
+    cover = ROOT / "resource" / "app_cover.png"
+    if cover.exists():
+        sep = ";" if sys.platform.startswith("win") else ":"
+        args += ["--add-data", f"{cover}{sep}resource"]
+        icon = _make_icon(cover)
+        if icon:
+            args += ["--icon", str(icon)]
+
     # macOS：给 .app 一个更友好的 bundle id
     if sys.platform == "darwin":
         args += ["--osx-bundle-identifier", "net.bilimanga.downloader"]

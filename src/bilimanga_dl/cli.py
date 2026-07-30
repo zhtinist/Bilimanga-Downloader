@@ -65,31 +65,39 @@ def run_download(config: Config, url_or_no: str) -> None:
     # 输出目录：已配置用配置值，否则默认浏览器下载目录 ~/Downloads。
     out_root = config.output_path()
 
+    from .novel import NovelDownloader, is_novel_url, parse_novel_no
     net = Net(config)
     scraper = Scraper(net)
+    is_novel = is_novel_url(url_or_no)
 
     # 解析书号（本地，无需联网）
     try:
-        book_no = parse_book_no(url_or_no)
+        book_no = parse_novel_no(url_or_no) if is_novel else parse_book_no(url_or_no)
     except ValueError as exc:
         _print(f"[red]{exc}[/red]")
         net.close()
         return
 
-    # 第 1 步：确认漫画
-    _rule("第 1 步 / 共 4 步：确认漫画")
-    detail_url = f"{config.site}/detail/{book_no}.html"
+    kind_label = "轻小说" if is_novel else "漫画"
+    _rule(f"第 1 步 / 共 4 步：确认{kind_label}")
+    if is_novel:
+        detail_url = f"https://www.linovelib.com/novel/{book_no}.html"
+    else:
+        detail_url = f"{config.site}/detail/{book_no}.html"
     net.warm_up(detail_url)  # 后台启动 Chrome + 预过 Cloudflare，隐藏冷启动耗时
 
     def _parse_book() -> Optional[Book]:
         _print("正在解析……（首次需启动浏览器过 Cloudflare，约 10–20 秒，可加 --debug 看详情）")
         try:
-            b = scraper.fetch_book(book_no)
+            if is_novel:
+                b = NovelDownloader(net).fetch_book(book_no)
+            else:
+                b = scraper.fetch_book(book_no)
         except Exception as exc:
             _print(f"[red]获取书籍信息失败：{exc}[/red]")
             return None
         if not b.volumes:
-            _print("[red]未解析到任何章节，可能是页面结构变化或该书需要登录。[/red]")
+            _print("[red]未解析到任何章节/卷，可能是页面结构变化或该书需要登录。[/red]")
             return None
         return b
 
@@ -132,22 +140,26 @@ def run_download(config: Config, url_or_no: str) -> None:
         net.close()
         return
 
-    # 第 4 步：格式
-    fmt = choose_format(config)
+    # 第 4 步：格式（轻小说固定 EPUB）
+    fmt = "epub" if is_novel else choose_format(config)
 
-    # 下载：临时图片放 temp/download/<书名>/，成品放 downloads/<书名>/
     target = out_root / safe_name(book.title)
     target.mkdir(parents=True, exist_ok=True)
-    _rule("开始下载（流水线：下载→校对→打包，逐卷产出）")
+    _rule("开始下载（逐卷产出）")
     _print(f"输出目录：[bold]{target}[/bold]")
-    downloader = Downloader(net, scraper, config)
     index_map = {v.index: v for v in book.volumes}
     volumes = [index_map[i] for i in selected]
-    build_fn = build_epub if fmt == "epub" else build_pdf
 
     outputs = []
     interrupted = False
     try:
+        if is_novel:
+            outputs = _run_novel_download(net, book, volumes, target)
+            net.close()
+            _print(f"\n[bold green]全部完成，共 {len(outputs)} 个文件 → {target}[/bold green]")
+            return
+        downloader = Downloader(net, scraper, config)
+        build_fn = build_epub if fmt == "epub" else build_pdf
         outputs = _run_pipeline_with_progress(
             downloader, book, volumes, TEMP_DOWNLOAD_DIR, target, build_fn)
     except KeyboardInterrupt:
@@ -172,6 +184,27 @@ def run_download(config: Config, url_or_no: str) -> None:
 
     if not interrupted:
         _print(f"\n[bold green]全部完成，共 {len(outputs)} 个文件 → {target}[/bold green]")
+
+
+def _run_novel_download(net: Net, book: Book, volumes, out_dir):
+    """轻小说：逐卷抓文本+插图 → 文字型 EPUB。"""
+    from .novel import NovelDownloader
+    nd = NovelDownloader(net, num_thread=4)
+    outputs = []
+    for v in volumes:
+        _print(f"[cyan]⬇ 下载卷[/cyan] {v.index}. {v.title}")
+
+        def on_phase(vi, ph):
+            label = {"download": "下载文本/插图", "package": "打包", "empty": "无内容"}.get(ph, ph)
+            _print(f"    {label}")
+
+        path = nd.download_volume(book, v, out_dir, on_phase=on_phase)
+        if path:
+            outputs.append(path)
+            _print(f"[green]✓ 完成[/green] {path.name}")
+        else:
+            _print(f"[yellow]⚠ 卷 {v.index} 无内容，跳过[/yellow]")
+    return outputs
 
 
 def _run_pipeline_with_progress(downloader: Downloader, book: Book, volumes,

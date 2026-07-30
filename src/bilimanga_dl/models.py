@@ -44,3 +44,5 @@ class Book:
     tags: List[str] = field(default_factory=list)
     volumes: List[Volume] = field(default_factory=list)
     base_url: str = ""         # 实际连通的镜像域名
+    kind: str = "manga"        # manga（漫画，图片）| novel（轻小说，文字+插图）
+    publisher: str = ""        # 轻小说文库/出版方（novel）
