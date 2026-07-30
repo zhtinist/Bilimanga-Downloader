@@ -16,6 +16,14 @@ import shutil
 import sys
 from pathlib import Path
 
+# Windows 控制台默认 cp1252 编码无法输出中文，会让脚本在收尾打印时崩溃；
+# 统一把标准输出/错误切到 UTF-8（Python 3.7+）。
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8")  # type: ignore[attr-defined]
+    except Exception:
+        pass
+
 ROOT = Path(__file__).resolve().parents[1]
 SRC = ROOT / "src"
 ENTRY = ROOT / "packaging" / "app_entry.py"
