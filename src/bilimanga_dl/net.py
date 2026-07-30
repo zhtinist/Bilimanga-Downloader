@@ -565,22 +565,21 @@ class Net:
     def resolve_base_url(self) -> str:
         if self.base_url:
             return self.base_url
-        errors = []
-        for mirror in self.config.mirrors:
-            m = mirror.rstrip("/")
-            try:
-                if self.browser:
-                    self.browser.get_html(m + "/")
-                else:
-                    self._requests_fetch(m + "/")
-                self.base_url = m
-                log.info("使用镜像: %s", m)
-                return m
-            except Exception as exc:
-                log.warning("镜像 %s 不可用: %s", m, exc)
-                errors.append(f"{mirror}: {exc}")
-                continue
-        raise CloudflareBlocked("所有镜像域名均无法访问：\n" + "\n".join(errors))
+        m = self.config.site
+        try:
+            if self.browser:
+                self.browser.get_html(m + "/")
+            else:
+                self._requests_fetch(m + "/")
+            self.base_url = m
+            log.info("使用站点: %s", m)
+            return m
+        except Exception as exc:
+            log.warning("站点 %s 不可用: %s", m, exc)
+            raise CloudflareBlocked(
+                f"站点 {m} 无法访问：{exc}\n"
+                "请在设置里确认站点地址，并检查网络 / 代理 / Cloudflare。"
+            ) from exc
 
     def get_text(self, url: str, *, referer: Optional[str] = None,
                  wait_for: Optional[str] = None) -> str:

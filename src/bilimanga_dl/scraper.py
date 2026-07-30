@@ -71,25 +71,24 @@ class Scraper:
     def __init__(self, net: Net):
         self.net = net
 
-    def _fetch_detail_across_mirrors(self, book_no: str):
-        """逐个镜像抓详情页，返回 (base_url, html)。"""
-        if self.net.base_url:
-            base = self.net.base_url
-            return base, self.net.get_text(f"{base}/detail/{book_no}.html", referer=base)
-        errors = []
-        for mirror in self.net.config.mirrors:
-            base = mirror.rstrip("/")
-            try:
-                html = self.net.get_text(f"{base}/detail/{book_no}.html", referer=base)
-                return base, html
-            except Exception as exc:
-                log.warning("镜像 %s 抓取详情失败: %s", base, exc)
-                errors.append(f"{mirror}: {exc}")
-        raise RuntimeError("所有镜像均无法抓取详情页：\n" + "\n".join(errors))
+    def _fetch_detail(self, book_no: str):
+        """抓详情页，返回 (base_url, html)。单一站点，失败即明确报错。"""
+        base = self.net.base_url or self.net.config.site
+        try:
+            return base, self.net.get_text(
+                f"{base}/detail/{book_no}.html", referer=base)
+        except Exception as exc:
+            log.warning("抓取详情页失败 %s: %s", base, exc)
+            raise RuntimeError(
+                f"无法打开详情页 {base}/detail/{book_no}.html\n"
+                f"原因：{exc}\n"
+                "请确认：①书号/链接正确；②站点地址（设置里可改）可访问；"
+                "③已装 Chrome/Edge 且能过 Cloudflare。"
+            ) from exc
 
     def fetch_book(self, book_no: str) -> Book:
-        # 直接抓详情页（省掉一次首页导航）；逐个镜像尝试，成功即固定 base。
-        base, html = self._fetch_detail_across_mirrors(book_no)
+        # 直接抓详情页（省掉一次首页导航），成功即固定 base。
+        base, html = self._fetch_detail(book_no)
         self.net.base_url = base
         soup = _soup(html)
 

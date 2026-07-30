@@ -8,3 +8,9 @@ __pycache__/
 /logs/
 /downloads/
 /temp/
+crash.log
+
+# 打包产物（PyInstaller）
+/build/
+/dist/
+/*.spec

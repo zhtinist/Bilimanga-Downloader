@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Bilimanga 漫画下载器
 // @namespace    https://github.com/zhtinist/Bilimanga-Downloader
-// @version      1.0.0
+// @version      1.1.0
 // @description  在 bilimanga 漫画页面里一键把整卷下载成 EPUB / PDF，无需安装 Python 环境。
 // @author       HTZHU
 // @license      MIT
@@ -10,7 +10,6 @@
 // @icon         https://www.bilimanga.net/favicon.ico
 // @match        https://www.bilimanga.net/*
 // @match        https://www.bilicomic.net/*
-// @match        https://www.linovelib.com/*
 // @grant        GM_download
 // @grant        GM_xmlhttpRequest
 // @grant        GM_addStyle
@@ -37,6 +36,15 @@
 
   function sleep(ms) {
     return new Promise((r) => setTimeout(r, ms));
+  }
+
+  // 带超时的 fetch：卡住的请求会自动 abort，避免拖死并发池里的一个 worker。
+  function fetchWithTimeout(url, opts, ms) {
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), ms || 20000);
+    return fetch(url, Object.assign({ signal: ctrl.signal }, opts || {})).finally(() =>
+      clearTimeout(timer)
+    );
   }
 
   function escXml(s) {
@@ -127,7 +135,7 @@
   }
 
   async function fetchText(url) {
-    const resp = await fetch(url, { credentials: "include" });
+    const resp = await fetchWithTimeout(url, { credentials: "include" }, 20000);
     const html = await resp.text();
     if (isChallenge(html)) {
       throw new Error("页面被 Cloudflare 拦截，请在当前标签手动通过人机验证后重试。");
@@ -292,12 +300,41 @@
 
   async function fetchImageBytes(url) {
     try {
-      const resp = await fetch(url, { credentials: "include" });
+      const resp = await fetchWithTimeout(url, { credentials: "include" }, 25000);
       if (resp.ok) return new Uint8Array(await resp.arrayBuffer());
     } catch (e) {
-      // 跨域被拦：走 GM 兜底
+      // 跨域被拦 / 超时：走 GM 兜底
     }
     return gmFetchBytes(url);
+  }
+
+  // 把已解码的位图铺白底后编码成 JPEG。优先 OffscreenCanvas；缺失（部分浏览器/
+  // 脚本管理器不支持 OffscreenCanvas.convertToBlob）时退回普通 <canvas>，提升兼容性。
+  async function bitmapToJpeg(bitmap) {
+    const w = bitmap.width;
+    const h = bitmap.height;
+    let jpeg;
+    if (typeof OffscreenCanvas !== "undefined" && OffscreenCanvas.prototype.convertToBlob) {
+      const canvas = new OffscreenCanvas(w, h);
+      const ctx = canvas.getContext("2d");
+      ctx.fillStyle = "#ffffff";
+      ctx.fillRect(0, 0, w, h);
+      ctx.drawImage(bitmap, 0, 0);
+      const blob = await canvas.convertToBlob({ type: "image/jpeg", quality: 0.9 });
+      jpeg = new Uint8Array(await blob.arrayBuffer());
+    } else {
+      const canvas = document.createElement("canvas");
+      canvas.width = w;
+      canvas.height = h;
+      const ctx = canvas.getContext("2d");
+      ctx.fillStyle = "#ffffff";
+      ctx.fillRect(0, 0, w, h);
+      ctx.drawImage(bitmap, 0, 0);
+      const blob = await new Promise((res) => canvas.toBlob(res, "image/jpeg", 0.9));
+      if (!blob) throw new Error("canvas 编码失败");
+      jpeg = new Uint8Array(await blob.arrayBuffer());
+    }
+    return { jpeg, width: w, height: h };
   }
 
   async function fetchImageAsJpeg(url) {
@@ -309,17 +346,11 @@
     } catch (e) {
       throw new Error("图片解码失败：" + url);
     }
-    const w = bitmap.width;
-    const h = bitmap.height;
-    const canvas = new OffscreenCanvas(w, h);
-    const ctx = canvas.getContext("2d");
-    ctx.fillStyle = "#ffffff";
-    ctx.fillRect(0, 0, w, h);
-    ctx.drawImage(bitmap, 0, 0);
-    bitmap.close();
-    const jpegBlob = await canvas.convertToBlob({ type: "image/jpeg", quality: 0.9 });
-    const jpeg = new Uint8Array(await jpegBlob.arrayBuffer());
-    return { jpeg, width: w, height: h };
+    try {
+      return await bitmapToJpeg(bitmap);
+    } finally {
+      if (bitmap.close) bitmap.close();
+    }
   }
 
   // =====================================================================
@@ -719,11 +750,17 @@
 
   async function processVolume(book, vol, fmt, prog) {
     prog.setState("解析话列表…");
-    const chapterData = [];
-    for (const chap of vol.chapters) {
-      const urls = await fetchChapterImages(chap.url, book.base);
-      chapterData.push({ title: chap.title, urls, images: new Array(urls.length).fill(null) });
-    }
+    // 并发解析各话的图片地址（限流 4，兼顾速度与不触发 Cloudflare 限速）；
+    // 按原顺序写回，保证阅读顺序不乱。
+    const chapterData = new Array(vol.chapters.length);
+    await runPool(
+      vol.chapters.map((chap, i) => ({ chap, i })),
+      4,
+      async ({ chap, i }) => {
+        const urls = await fetchChapterImages(chap.url, book.base);
+        chapterData[i] = { title: chap.title, urls, images: new Array(urls.length).fill(null) };
+      }
+    );
     const total = chapterData.reduce((s, c) => s + c.urls.length, 0);
     if (total === 0) {
       prog.error("未解析到图片");

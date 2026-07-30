@@ -5,109 +5,94 @@
 A manga downloader for [bilimanga.net](https://www.bilimanga.net/): scrapes the artwork and packages each
 volume into **EPUB** or **PDF**.
 
-**Two ways to use it:**
+> **The command-line / desktop app (this repo) is the recommended way.** It ships a built-in GUI (a local
+> web UI) and also works purely from the terminal — most stable.
+> The 🐵 userscript ([`userscript/`](userscript)) is **currently unstable** (breaks easily due to site
+> DOM changes, cross-origin prompts and browser differences); keep it only as a fallback and switch back
+> to this repo if it misbehaves.
 
-| | CLI (main repo) | 🐵 Userscript ([`userscript/`](userscript)) |
-|---|---|---|
-| For | comfortable with a terminal; wants pipeline / concurrency / resume | **non-technical users**, zero setup |
-| Runtime | Python (`start.py` auto-installs deps) + local Chrome/Edge | **no Python**: install Tampermonkey, then one-click the script |
-| Install | `python3 start.py` | install Tampermonkey from the store → click `bilimanga.user.js` to install, auto-updates |
-| Platform | macOS / Windows | macOS / Windows (any Chromium/Firefox) |
-| Whose CPU | your machine | your machine (script runs same-origin in your own browser) |
+## Three ways to use it (in recommended order)
 
-> The userscript runs **same-origin inside the bilimanga page**, reusing your **already-passed Cloudflare
-> session** — so no environment to install and no cross-origin issues. While you're on a book's detail /
-> catalog page, a **"⬇ Download this book" button appears on the right edge**; open it to pick chapters +
-> format and download — no pasting URLs, no confirm step.
-> **One-click install:** get [Tampermonkey](https://www.tampermonkey.net/), then open the [Greasy Fork page](https://greasyfork.org/en/scripts/588995) and click "Install this script" (auto-updates). On the first download Tampermonkey asks for cross-origin permission — **click "Always allow"** (images are on a separate CDN subdomain). Details in [`userscript/README.md`](userscript/README.md).
-> The rest of this page documents the **CLI**.
+| | ⭐ Double-click executable | ⭐ CLI / from source | 🐵 Userscript (unstable, fallback) |
+|---|---|---|---|
+| For | non-technical users, zero setup | terminal users / hackers | don't want to install anything |
+| Runtime | **no Python**, just local Chrome/Edge | Python + local Chrome/Edge | browser + Tampermonkey |
+| Get it | download for your OS from [Releases](../../releases), double-click | `python3 start.py` | install Tampermonkey → install script |
+| UI | double-click opens a **GUI** (web UI) | GUI by default, `--cli` for terminal | floating button on the page |
+| Platform | macOS / Windows | macOS / Windows | any |
 
-## Demo (example: book 703《與妳相戀到生命盡頭》)
+## 1. Double-click executable (recommended, no Python)
 
-One command runs the whole flow: confirm → parse catalog → pick chapters → pick format → download & build.
+1. Download for your OS from [Releases](../../releases):
+   - **macOS**: `Bilimanga-Downloader-macOS.zip` → unzip → double-click `Bilimanga-Downloader.app`.
+   - **Windows**: `Bilimanga-Downloader-Windows.zip` → unzip → double-click `Bilimanga-Downloader.exe`.
+2. It opens a **GUI** in your browser automatically (`http://127.0.0.1:8765`).
+3. In the UI: paste a book URL or id and click Parse → tick the volumes → Download. Files go to your
+   **browser's Downloads folder** (`~/Downloads`) by default; change it anytime in "① Settings".
 
-![run flow](docs/run-flow.png)
+> Requires **Chrome or Edge** installed locally (used to pass Cloudflare). The first parse launches the
+> browser and takes ~10–20 s. On macOS, if Gatekeeper blocks the first launch, allow it via
+> System Settings → Privacy & Security → "Open Anyway".
 
-**Each selected volume gets its own progress bar**, moving through
-`download → 🔍 validate → 📦 package → ✓ done`. Volumes download one at a time; as soon as a volume
-finishes downloading it is validated + packaged in the background (overlapping the next volume's
-download), so EPUBs appear one by one:
-
-![per-volume progress](docs/run-progress.png)
-
-## Quick start
-
-```bash
-python3 start.py
-```
-
-`start.py` auto-creates an isolated conda env `bilimanga-dl` (falls back to a project-local `.venv` if
-conda is absent — neither pollutes your system), installs deps, then opens the CLI. You can also pass an
-argument directly:
+## 2. CLI / from source
 
 ```bash
-python3 start.py https://www.bilimanga.net/detail/703.html   # detail-page URL
-python3 start.py https://www.bilimanga.net/read/703/catalog  # catalog URL
-python3 start.py 703                                         # book id
+python3 start.py            # launches the GUI (local web UI) by default
+python3 start.py --cli      # interactive terminal menu
+python3 start.py https://www.bilimanga.net/detail/54.html   # detail URL, download directly
+python3 start.py 54                                         # book id, download directly
+python3 start.py --out ~/Downloads/manga 54                 # override output dir for this run
 python3 start.py --debug    # debug logging
 ```
 
-> Want a GUI / zero setup? See the userscript [`userscript/`](userscript) (recommended) or the browser
-> extension [`crx/`](crx) — the CLI itself is now terminal-only.
+`start.py` auto-creates an isolated conda env `bilimanga-dl` (falls back to a project-local `.venv` if
+conda is absent — neither pollutes your system), installs deps, then starts.
 
-## Flow (CLI, 4 steps)
+The CLI download is 4 steps: **confirm → parse catalog → pick chapters (e.g. `1-9,15,20-25`, Enter = all)
+→ pick format**, then a pipeline produces one volume at a time.
 
-1. **Confirm** — by default just prints the title in the terminal for a quick check; press Enter / y.
-   You can enable "open the page in a browser" in settings for a visual check (the automation browser
-   warms up in the background).
-2. **Parse catalog** — a real browser passes Cloudflare and scrapes the table of contents.
-3. **Pick chapters** — listed as `index + title + which episodes`; type e.g. `1-9,15,19,20-25`
-   (Enter = all).
-4. **Pick format** — EPUB / PDF, then the download pipeline runs, producing one volume at a time.
+## Settings
+
+In the GUI "① Settings" panel, or `--cli` → Settings:
+
+- **Site URL** — defaults to `https://www.bilimanga.net`, editable (no more built-in mirror fallback, so it
+  never silently connects to a different site).
+- **Output folder** — defaults to your **browser's Downloads folder** (`~/Downloads`); change it to any
+  folder (output is grouped by book title).
+- Default format (EPUB/PDF), concurrency, proxy, rate-limit / backoff-retry / resume, debug logging, etc.
+
+Settings and logs live in the project dir when run from source, or in the OS app-data dir when packaged
+(macOS `~/Library/Application Support/Bilimanga-Downloader`, Windows `%APPDATA%\Bilimanga-Downloader`).
 
 ## Optimizations / Features
 
-- **Cloudflare bypass** — DrissionPage drives a local Chrome/Edge; a real browser fingerprint passes
-  the challenge.
-- **3-stage pipeline (download → validate → package)** — volumes download sequentially; the moment a
-  volume finishes, validation + packaging run in the background, **overlapping** the next volume's
-  download. EPUBs are produced volume by volume; total time ≈ download time.
-- **Per-volume progress bars** — pick N volumes → N bars, each showing download / validate / package /
-  done at a glance.
-- **Adaptive concurrency (sampled every 1 s)** — starts with a few workers and adjusts each second by
-  that second's error rate: `0 → +1`, `<40% → −1`, `≥40% → −2` (hard backoff when rate-limited).
-  **Shrinking is graceful**: it only lowers the ceiling and never aborts in-flight downloads — busy
-  threads finish their current image and simply aren't given new work (no re-downloading, no waste).
-- **Lazy-load fix** — reader-page images are injected by JS; the scraper waits for `imagecontent` and
-  retries, so later volumes never come up empty.
-- **Resume** — temp images live in `temp/download/<title>/<chapter>/`; re-runs skip what's already
-  downloaded, and temp is cleaned after packaging.
-- **Local validation (offline)** — the validate stage only checks for missing/empty files; gaps are fed
-  back to the download stage, no re-crawling.
-- **Per-volume cover** — each EPUB's cover is that volume's first image (distinct per volume); series /
-  volume metadata is written for reader-app grouping.
-- **No special network config** — the browser uses your system's network as-is; only the local CDP
-  connection bypasses the proxy (otherwise the tool can't reach the browser when a proxy is on).
-- **Mirror fallback / three input forms (detail · catalog · id) / EPUB & PDF** (PDF lays out each image
-  full-page, no distortion or padding).
+- **Cloudflare bypass** — DrissionPage drives a local Chrome/Edge; a real browser fingerprint passes the challenge.
+- **3-stage pipeline (download → validate → package)** — volumes download sequentially; the moment one
+  finishes, validation + packaging run in the background, **overlapping** the next download. Total time ≈ download time.
+- **Per-volume progress bars** — pick N volumes → N bars, each showing download / validate / package / done.
+- **Adaptive concurrency (sampled every 1 s)** — `0 → +1`, `<40% → −1`, `≥40% → −2`; graceful shrink that never aborts in-flight downloads.
+- **AVIF/WebP → JPEG** — site artwork is often AVIF (e.g. book 54); converted to JPEG for EPUB/PDF compatibility, keeping original pixels.
+- **Lazy-load fix** — waits for `imagecontent` and retries so later volumes never come up empty.
+- **Resume** — temp images in `temp/download/<title>/<chapter>/`; re-runs skip what's done, temp cleaned after packaging.
+- **Three input forms** (detail · catalog · id) **/ EPUB & PDF** (PDF lays out each image full-page, no distortion or padding).
 
 ## Layout
 
 ```
 Bilimanga-Downloader/
-├── start.py              # CLI entry point
+├── start.py              # entry: GUI by default, --cli for terminal
 ├── docs/                 # screenshots
+├── packaging/            # PyInstaller scripts & GitHub Actions workflow
 ├── src/
 │   ├── requirements.txt
-│   └── bilimanga_dl/     # CLI source (net / scraper / downloader / build_* / cli / ui …)
-├── userscript/           # 🐵 userscript build (bilimanga.user.js — zero-setup GUI)
-├── config/setting.json   # generated at runtime
-├── logs/  temp/  downloads/<title>/   # generated at runtime (gitignored)
+│   └── bilimanga_dl/     # source (net / scraper / downloader / build_* / cli / webui / ui …)
+├── userscript/           # 🐵 userscript build (fallback, unstable)
+└── (generated at runtime) config / logs / temp / your output folder
 ```
 
 ## Requirements
 
 - **Chrome or Edge** must be installed locally (DrissionPage drives it to pass Cloudflare).
-- Other Python deps are in `src/requirements.txt`; `start.py` installs them automatically.
+- From source, other Python deps are in `src/requirements.txt` (`start.py` installs them); executables bundle everything.
 
 > For personal study / backing up public content only. Please respect the site's terms.

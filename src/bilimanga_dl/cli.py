@@ -9,7 +9,7 @@ from typing import List, Optional
 
 from .build_epub import build_epub
 from .build_pdf import build_pdf
-from .config import Config, DOWNLOADS_DIR, TEMP_DOWNLOAD_DIR
+from .config import Config, TEMP_DOWNLOAD_DIR
 from .downloader import Downloader, safe_name
 from .logutil import debug_requested, get_logger, setup_logging
 from .models import Book
@@ -62,6 +62,9 @@ def choose_format(config: Config) -> str:
 
 
 def run_download(config: Config, url_or_no: str) -> None:
+    # 输出目录：已配置用配置值，否则默认浏览器下载目录 ~/Downloads。
+    out_root = config.output_path()
+
     net = Net(config)
     scraper = Scraper(net)
 
@@ -75,7 +78,7 @@ def run_download(config: Config, url_or_no: str) -> None:
 
     # 第 1 步：确认漫画
     _rule("第 1 步 / 共 4 步：确认漫画")
-    detail_url = f"{config.mirrors[0].rstrip('/')}/detail/{book_no}.html"
+    detail_url = f"{config.site}/detail/{book_no}.html"
     net.warm_up(detail_url)  # 后台启动 Chrome + 预过 Cloudflare，隐藏冷启动耗时
 
     def _parse_book() -> Optional[Book]:
@@ -133,7 +136,7 @@ def run_download(config: Config, url_or_no: str) -> None:
     fmt = choose_format(config)
 
     # 下载：临时图片放 temp/download/<书名>/，成品放 downloads/<书名>/
-    target = DOWNLOADS_DIR / safe_name(book.title)
+    target = out_root / safe_name(book.title)
     target.mkdir(parents=True, exist_ok=True)
     _rule("开始下载（流水线：下载→校对→打包，逐卷产出）")
     _print(f"输出目录：[bold]{target}[/bold]")
@@ -217,10 +220,12 @@ def _run_pipeline_with_progress(downloader: Downloader, book: Book, volumes,
 
 def _print_help() -> None:
     _print("用法：")
-    _print("  python3 start.py                进入交互式命令行菜单")
+    _print("  python3 start.py                启动图形界面（本地网页 UI）")
+    _print("  python3 start.py --cli          进入交互式命令行菜单")
     _print("  python3 start.py <URL>          直接下载指定漫画")
     _print("  python3 start.py --debug        开启调试日志")
-    _print("  （想要图形界面？见 README 的浏览器插件，crx/ 目录）")
+    _print("  python3 start.py --out <目录>   本次输出到指定目录（不写回设置）")
+    _print("  下载输出目录默认用浏览器下载目录 ~/Downloads，可在「设置」里修改。")
     _print("  输入支持三种：详情页链接 / 目录页链接 / 书号，例如：")
     _print("    python3 start.py https://www.bilimanga.net/detail/703.html")
     _print("    python3 start.py https://www.bilimanga.net/read/703/catalog")
@@ -240,12 +245,26 @@ def main(argv: Optional[List[str]] = None) -> int:
     if "--help" in argv or "-h" in argv:
         _print_help()
         return 0
+    # --out <目录>：本次运行临时指定输出目录（不写回设置）
+    if "--out" in argv:
+        i = argv.index("--out")
+        if i + 1 < len(argv):
+            config.output_dir = argv[i + 1]
+            del argv[i:i + 2]
+
+    force_cli = "--cli" in argv
     # 去掉开关参数，剩下的第一个非开关项当作 URL
-    argv = [a for a in argv if a not in ("--debug", "--cli")]
+    argv = [a for a in argv if a not in ("--debug", "--cli", "--ui")]
 
     # 命令行：带 URL 参数直接下载
     if argv:
         run_download(config, argv[0])
+        return 0
+
+    # 无 URL 参数：默认启动图形界面；--cli 才进终端菜单
+    if not force_cli:
+        from .webui import serve
+        serve(config)
         return 0
 
     # 交互式菜单

@@ -1,19 +1,40 @@
-"""设置（终端）：默认格式、并发数、代理，以及限速 / 退避重试 / 断点续传 /
-确认时是否弹网页 / 调试日志开关。
+"""设置（终端）：站点地址、下载输出目录、默认格式、并发数、代理，以及
+限速 / 退避重试 / 断点续传 / 确认时是否弹网页 / 调试日志开关。
 
-下载目录固定为 ``<root>/downloads/``（按书名分子目录），不在此配置。
-修改后写回 config/setting.json。
+输出目录由用户指定（未设置则不执行下载）；修改后写回 config/setting.json。
 """
 
 from __future__ import annotations
 
-from ..config import Config, DOWNLOADS_DIR
+from pathlib import Path
+
+from ..config import Config, DEFAULT_SITE, default_download_dir
 
 
 def open_settings(config: Config, use_terminal: bool = True) -> None:
     """终端逐项修改设置。``use_terminal`` 仅为兼容旧签名。"""
     print("\n===== 设置（直接回车保留当前值）=====")
-    print(f"（下载目录固定为：{DOWNLOADS_DIR}，按书名分子目录，不可修改）")
+
+    cur_site = config.site_url or DEFAULT_SITE
+    v = input(f"站点地址 [{cur_site}]（如 {DEFAULT_SITE}）: ").strip()
+    if v:
+        if not v.startswith("http"):
+            v = "https://" + v
+        config.site_url = v.rstrip("/")
+
+    cur_out = config.output_dir or f"浏览器下载目录 {default_download_dir()}"
+    print(f"下载输出目录 [{cur_out}]（留空=用浏览器下载目录；输入 none 清空恢复默认）:")
+    v = input("→ ").strip()
+    if v.lower() == "none":
+        config.output_dir = ""
+    elif v:
+        p = Path(v).expanduser()
+        try:
+            p.mkdir(parents=True, exist_ok=True)
+            config.output_dir = str(p)
+        except OSError as exc:
+            print(f"  无法创建该目录：{exc}（未修改）")
+
     v = input(f"默认格式 epub/pdf [{config.default_format}]: ").strip().lower()
     if v in ("epub", "pdf"):
         config.default_format = v
@@ -43,3 +64,4 @@ def open_settings(config: Config, use_terminal: bool = True) -> None:
         config.debug = (v == "y")
     config.save()
     print("设置已保存。")
+    print(f"文件将保存到：{config.output_path()}")

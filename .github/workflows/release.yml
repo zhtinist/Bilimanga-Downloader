@@ -1,0 +1,76 @@
+name: Build & Release
+
+# 推送形如 v1.2.3 的 tag 时触发：分别在 macOS / Windows 上打包，
+# 产物压缩后作为 GitHub Release 附件发布。也可在 Actions 页手动触发。
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            asset: Bilimanga-Downloader-macOS.zip
+          - os: windows-latest
+            asset: Bilimanga-Downloader-Windows.zip
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install pyinstaller
+          pip install -r src/requirements.txt
+
+      - name: Build
+        run: python packaging/build.py
+
+      - name: Package (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          cd dist
+          zip -ry ../${{ matrix.asset }} "Bilimanga-Downloader.app"
+
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        run: Compress-Archive -Path dist/Bilimanga-Downloader/* -DestinationPath ${{ matrix.asset }}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: ${{ matrix.asset }}
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - name: Publish Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/**/*.zip
+          generate_release_notes: true
+          body: |
+            双击即用，无需本地 Python（需本机已装 Chrome/Edge 以过 Cloudflare）。
+
+            - macOS：下载 `Bilimanga-Downloader-macOS.zip`，解压后双击 `Bilimanga-Downloader.app`。
+              首次打开若被 Gatekeeper 拦，在「系统设置 → 隐私与安全性」点「仍要打开」。
+            - Windows：下载 `Bilimanga-Downloader-Windows.zip`，解压后双击 `Bilimanga-Downloader.exe`。
+
+            启动后会自动打开图形界面（`http://127.0.0.1:8765`）。首次使用请先在「设置」里填写“下载输出目录”。

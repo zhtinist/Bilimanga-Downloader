@@ -1,46 +1,69 @@
 """配置读写。
 
-所有运行时生成的文件都放在**项目根目录**内（不外溢到用户主目录）：
-- 设置文件：``<root>/config/setting.json``
-- 日志：      ``<root>/logs/``
-- 下载输出：  ``<root>/downloads/<书名>/``
-使用 :mod:`pathlib` 保证 macOS / Windows 行为一致。
+运行时生成的文件（设置 / 日志 / 临时图片）放在**应用数据目录**：
+- 从源码运行：项目根目录（方便开发时查看）。
+- 打包成可执行文件后：用户可写的系统应用数据目录
+  （macOS ``~/Library/Application Support/Bilimanga-Downloader``，
+   Windows ``%APPDATA%\\Bilimanga-Downloader``），
+  因为可执行文件所在目录（尤其是 macOS .app / Program Files）通常只读。
+
+下载输出目录（``output_dir``）默认使用浏览器的下载目录（``~/Downloads``），
+用户也可在设置里改成任意目录。使用 :mod:`pathlib` 保证 macOS / Windows 行为一致。
 """
 
 from __future__ import annotations
 
 import json
-from dataclasses import asdict, dataclass, field
+import os
+import sys
+from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import List
 
 
-# 项目根目录：本文件位于 <root>/src/bilimanga_dl/config.py，向上三级即根目录。
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
+def _app_data_dir() -> Path:
+    """运行时数据目录：源码运行→项目根；打包后→系统应用数据目录（可写）。"""
+    if getattr(sys, "frozen", False):  # PyInstaller 等打包环境
+        if sys.platform == "darwin":
+            base = Path.home() / "Library" / "Application Support"
+        elif sys.platform.startswith("win"):
+            base = Path(os.environ.get("APPDATA", Path.home()))
+        else:
+            base = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config"))
+        return base / "Bilimanga-Downloader"
+    # 源码运行：本文件位于 <root>/src/bilimanga_dl/config.py，向上三级即根目录。
+    return Path(__file__).resolve().parents[2]
+
+
+# 项目根 / 应用数据根
+PROJECT_ROOT = _app_data_dir()
 CONFIG_DIR = PROJECT_ROOT / "config"
 CONFIG_PATH = CONFIG_DIR / "setting.json"
 LOG_DIR = PROJECT_ROOT / "logs"
 
-# 下载目录固定为项目根目录下的 downloads/，不可配置；最终按书名分子目录打包。
-DOWNLOADS_DIR = PROJECT_ROOT / "downloads"
 # 下载过程中的临时图片目录：temp/download/<书名>/<章>/，边下边落盘，避免内存堆积。
 TEMP_DOWNLOAD_DIR = PROJECT_ROOT / "temp" / "download"
 
-# 站点的历史/镜像域名，主域名不可用时自动向后尝试。
-DEFAULT_MIRRORS: List[str] = [
-    "https://www.bilimanga.net",
-    "https://www.bilicomic.net",
-    "https://www.linovelib.com",
-]
+# 站点默认地址（可在设置里修改）。
+DEFAULT_SITE = "https://www.bilimanga.net"
+
+
+def default_download_dir() -> Path:
+    """浏览器/系统默认下载目录：``~/Downloads``；不存在则退回用户主目录。"""
+    d = Path.home() / "Downloads"
+    return d if d.exists() else Path.home()
 
 
 @dataclass
 class Config:
-    # 输出格式（下载目录固定为 DOWNLOADS_DIR，不在此配置）
+    # 输出格式
     default_format: str = "epub"  # epub | pdf
 
+    # 下载输出目录：留空则默认用浏览器下载目录 ~/Downloads（按书名分子目录打包）。
+    output_dir: str = ""
+
     # 网络
-    mirrors: List[str] = field(default_factory=lambda: list(DEFAULT_MIRRORS))
+    # 站点地址（单一站点，可在设置里修改；不再内置镜像回退，避免误连到别的站点）。
+    site_url: str = DEFAULT_SITE
     parallel_chapters: int = 12  # 并发上限（自适应 AIMD 从低起步，最多爬到这个值）
     request_timeout: int = 30
 
@@ -105,3 +128,16 @@ class Config:
 
     def to_dict(self) -> dict:
         return asdict(self)
+
+    # ---- 派生属性 ----
+    @property
+    def site(self) -> str:
+        """规范化站点地址（去掉尾部斜杠）。"""
+        return (self.site_url or DEFAULT_SITE).strip().rstrip("/")
+
+    def output_path(self) -> Path:
+        """输出目录（Path）：已配置用配置值，否则默认浏览器下载目录 ~/Downloads。"""
+        p = (self.output_dir or "").strip()
+        if not p:
+            return default_download_dir()
+        return Path(p).expanduser()
