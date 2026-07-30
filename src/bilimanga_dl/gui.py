@@ -27,8 +27,8 @@ from tkinter import filedialog, messagebox, ttk
 
 from .build_epub import build_epub
 from .build_pdf import build_pdf
-from .config import Config, DEFAULT_SITE, TEMP_DOWNLOAD_DIR, default_download_dir
-from .downloader import Downloader, safe_name
+from .config import Config, TEMP_DOWNLOAD_DIR, default_download_dir
+from .downloader import Downloader, cleanup_book_temp, safe_name
 from .logutil import get_logger
 from .models import Book
 from .net import Net
@@ -77,6 +77,7 @@ class DownloaderGUI:
         self.msgq: "queue.Queue" = queue.Queue()
         self.busy = False
         self.view = "home"
+        self._dl_title = ""
 
         self._init_style()
         self._build()
@@ -247,25 +248,24 @@ class DownloaderGUI:
                                                     sticky="w", pady=(0, 10))
 
         self._label(f, "站点地址").grid(row=1, column=0, sticky="w", **pad)
-        self.var_site = tk.StringVar(value=self.config.site_url or DEFAULT_SITE)
-        self._entry(f, self.var_site).grid(row=1, column=1, columnspan=2, sticky="ew", ipady=4, **pad)
+        self._label(f, self.config.site, fg=MUTED).grid(row=1, column=1, columnspan=2,
+                                                        sticky="w", **pad)
 
         self._label(f, "下载目录").grid(row=2, column=0, sticky="w", **pad)
         self.var_out = tk.StringVar(value=self.config.output_dir or "")
         self._entry(f, self.var_out).grid(row=2, column=1, sticky="ew", ipady=4, **pad)
         ttk.Button(f, text="浏览…", command=self._browse_out).grid(row=2, column=2, **pad)
 
-        self._label(f, "并发数").grid(row=3, column=0, sticky="w", **pad)
-        self.var_par = tk.StringVar(value=str(self.config.parallel_chapters))
-        self._entry(f, self.var_par, width=8).grid(row=3, column=1, sticky="w", ipady=4, **pad)
-
-        self._label(f, "代理").grid(row=4, column=0, sticky="w", **pad)
+        self._label(f, "代理").grid(row=3, column=0, sticky="w", **pad)
         self.var_proxy = tk.StringVar(value=self.config.proxy or "")
-        self._entry(f, self.var_proxy).grid(row=4, column=1, columnspan=2, sticky="ew", ipady=4, **pad)
+        self._entry(f, self.var_proxy).grid(row=3, column=1, columnspan=2, sticky="ew", ipady=4, **pad)
 
         self.var_hint = tk.StringVar()
         self._label(f, textvariable=self.var_hint, fg=MUTED, font=FONT_SM).grid(
-            row=5, column=0, columnspan=3, sticky="w", padx=8, pady=(2, 12))
+            row=4, column=0, columnspan=3, sticky="w", padx=8, pady=(2, 4))
+        self._label(f, "下载线程数自动调节（4 起步），无需设置。",
+                    fg=MUTED, font=FONT_SM).grid(row=5, column=0, columnspan=3, sticky="w",
+                                                 padx=8, pady=(0, 12))
         self._refresh_hint()
 
         ttk.Button(f, text="保存设置", style="Accent.TButton", command=self._save_cfg).grid(
@@ -275,7 +275,13 @@ class DownloaderGUI:
         f = self.progress
         f.columnconfigure(0, weight=1)
         f.rowconfigure(1, weight=1)
-        self._label(f, "下载进度", font=FONT_TITLE).grid(row=0, column=0, sticky="w", pady=(0, 10))
+        head = self._frame(f)
+        head.grid(row=0, column=0, sticky="ew", pady=(0, 10))
+        head.columnconfigure(0, weight=1)
+        self._label(head, "下载进度", font=FONT_TITLE).grid(row=0, column=0, sticky="w")
+        self.var_conc = tk.StringVar(value="🧵 并发线程：4")
+        self._label(head, textvariable=self.var_conc, fg=ACCENT, font=FONT_SM).grid(
+            row=0, column=1, sticky="e")
         wrap = self._frame(f, bg=CARD, highlightthickness=1, highlightbackground=BORDER)
         wrap.grid(row=1, column=0, sticky="nsew")
         self.tree = ttk.Treeview(wrap, columns=("state", "prog"), show="tree headings")
@@ -334,10 +340,7 @@ class DownloaderGUI:
 
     def _apply_cfg(self) -> bool:
         c = self.config
-        site = self.var_site.get().strip()
-        if site and not site.startswith("http"):
-            site = "https://" + site
-        c.site_url = (site or DEFAULT_SITE).rstrip("/")
+        # 站点地址固定，仅展示、不支持修改
         out = self.var_out.get().strip()
         if out:
             try:
@@ -348,9 +351,6 @@ class DownloaderGUI:
         c.output_dir = out
         if self.var_fmt.get() in ("epub", "pdf"):
             c.default_format = self.var_fmt.get()
-        par = self.var_par.get().strip()
-        if par.isdigit() and int(par) > 0:
-            c.parallel_chapters = int(par)
         c.proxy = self.var_proxy.get().strip()
         return True
 
@@ -427,7 +427,9 @@ class DownloaderGUI:
             self.prog_rows[v.index] = iid
 
         self.busy = True
+        self._dl_title = self.book.title  # 供中断清理定位 temp
         self.btn_reveal.configure(state="disabled")
+        self.var_conc.set("🧵 并发线程：4")
         self.var_status.set(f"下载中，输出到：{out_root}")
         self._show("progress")
         threading.Thread(target=self._download_worker, args=(vols, out_root),
@@ -448,7 +450,8 @@ class DownloaderGUI:
                 on_total=lambda vi, n: q.put(("v_total", vi, n)),
                 on_image=lambda vi: q.put(("v_image", vi)),
                 on_phase=lambda vi, ph: q.put(("v_phase", vi, ph)),
-                on_done=lambda vi, p: q.put(("v_done", vi, p.name if p else "")))
+                on_done=lambda vi, p: q.put(("v_done", vi, p.name if p else "")),
+                on_concurrency=lambda n: q.put(("concurrency", n)))
             q.put(("all_done", str(target)))
         except Exception as exc:  # noqa: BLE001
             log.exception("下载失败")
@@ -482,6 +485,8 @@ class DownloaderGUI:
             self._set_prog(msg[1], phase=msg[2])
         elif kind == "v_done":
             self._set_prog(msg[1], phase="done" if msg[2] else "empty", name=msg[2])
+        elif kind == "concurrency":
+            self.var_conc.set(f"🧵 并发线程：{msg[1]}")
         elif kind == "all_done":
             self.busy = False
             self.btn_reveal.configure(state="normal")
@@ -492,6 +497,10 @@ class DownloaderGUI:
             self.busy = False
             self.nav_btn.configure(state="normal")
             self.var_status.set("下载出错：" + msg[1])
+            # 异常中断：清理该书临时图片 + 退出浏览器释放内存
+            if self._dl_title:
+                cleanup_book_temp(TEMP_DOWNLOAD_DIR, self._dl_title)
+            self._reset_net()
             messagebox.showerror("下载出错", msg[1])
 
     def _set_prog(self, vidx, total=None, inc=0, phase=None, name=None):
@@ -532,7 +541,10 @@ class DownloaderGUI:
     def _on_close(self):
         if self.busy and not messagebox.askokcancel("退出", "任务仍在进行，确定退出？"):
             return
-        self._reset_net()
+        # 若在下载中途退出：清理该书临时图片，避免残留占盘
+        if self.busy and self._dl_title:
+            cleanup_book_temp(TEMP_DOWNLOAD_DIR, self._dl_title)
+        self._reset_net()  # 退出浏览器，释放内存
         self.root.destroy()
 
 

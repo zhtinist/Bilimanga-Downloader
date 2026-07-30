@@ -53,9 +53,10 @@ python3 start.py --debug    # 调试日志
 
 图形界面「① 设置」或命令行 `--cli` → 设置里可改：
 
-- **站点地址**：默认 `https://www.bilimanga.net`，可改（不再内置多镜像回退，避免误连到别的站点）。
+- **站点地址**：固定 `https://www.bilimanga.net`（仅展示，不支持修改；不再内置多镜像回退，避免误连到别的站点）。
 - **下载输出目录**：默认用**浏览器下载目录**（`~/Downloads`），可改成任意目录（成品按书名分子目录存放）。
-- 默认格式（EPUB/PDF）、并发数、代理、限速 / 退避重试 / 断点续传、调试日志等。
+- **下载线程数**：固定 4 线程起步、按网络自适应升降（界面实时显示当前线程数），无需手动设置。
+- 默认格式（EPUB/PDF）、代理、限速 / 退避重试 / 断点续传、调试日志等。
 
 设置与日志保存在：源码运行时为项目目录；打包运行时为系统应用数据目录
 （macOS `~/Library/Application Support/Bilimanga-Downloader`，Windows `%APPDATA%\Bilimanga-Downloader`）。

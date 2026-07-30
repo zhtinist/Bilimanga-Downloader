@@ -10,7 +10,7 @@ from typing import List, Optional
 from .build_epub import build_epub
 from .build_pdf import build_pdf
 from .config import Config, TEMP_DOWNLOAD_DIR
-from .downloader import Downloader, safe_name
+from .downloader import Downloader, cleanup_book_temp, safe_name
 from .logutil import debug_requested, get_logger, setup_logging
 from .models import Book
 from .net import Net
@@ -145,20 +145,33 @@ def run_download(config: Config, url_or_no: str) -> None:
     volumes = [index_map[i] for i in selected]
     build_fn = build_epub if fmt == "epub" else build_pdf
 
-    outputs = _run_pipeline_with_progress(
-        downloader, book, volumes, TEMP_DOWNLOAD_DIR, target, build_fn)
-
-    net.close()
-
-    # 收尾：若该书临时目录已空则一并删除
-    book_temp = TEMP_DOWNLOAD_DIR / safe_name(book.title)
+    outputs = []
+    interrupted = False
     try:
-        if book_temp.exists() and not any(book_temp.iterdir()):
-            book_temp.rmdir()
-    except OSError:
-        pass
+        outputs = _run_pipeline_with_progress(
+            downloader, book, volumes, TEMP_DOWNLOAD_DIR, target, build_fn)
+    except KeyboardInterrupt:
+        interrupted = True
+        _print("\n[yellow]已中断下载，正在清理临时文件…[/yellow]")
+    except Exception as exc:  # noqa: BLE001
+        interrupted = True
+        _print(f"\n[red]下载出错：{exc}，正在清理临时文件…[/red]")
+    finally:
+        # 无论正常/异常/中断：关闭浏览器释放内存，并清理该书临时图片。
+        net.close()
+        if interrupted:
+            cleanup_book_temp(TEMP_DOWNLOAD_DIR, book.title)
+        else:
+            # 正常结束：临时目录已在打包时逐卷删除，兜底清掉可能残留的空目录
+            book_temp = TEMP_DOWNLOAD_DIR / safe_name(book.title)
+            try:
+                if book_temp.exists() and not any(book_temp.iterdir()):
+                    book_temp.rmdir()
+            except OSError:
+                pass
 
-    _print(f"\n[bold green]全部完成，共 {len(outputs)} 个文件 → {target}[/bold green]")
+    if not interrupted:
+        _print(f"\n[bold green]全部完成，共 {len(outputs)} 个文件 → {target}[/bold green]")
 
 
 def _run_pipeline_with_progress(downloader: Downloader, book: Book, volumes,
@@ -177,6 +190,10 @@ def _run_pipeline_with_progress(downloader: Downloader, book: Book, volumes,
         ) as progress:
             tasks = {v.index: progress.add_task(f"⏳ 等待  {v.title}", total=None,
                                                 start=False) for v in volumes}
+            conc_task = progress.add_task("🧵 并发线程：4", total=1, completed=0)
+
+            def on_concurrency(n):
+                progress.update(conc_task, description=f"🧵 并发线程：{n}")
 
             def on_start(vidx):
                 progress.start_task(tasks[vidx])
@@ -205,7 +222,7 @@ def _run_pipeline_with_progress(downloader: Downloader, book: Book, volumes,
             return downloader.run_pipeline(
                 book, volumes, temp_dir, out_dir, build_fn,
                 on_start=on_start, on_total=on_total, on_image=on_image,
-                on_phase=on_phase, on_done=on_done)
+                on_phase=on_phase, on_done=on_done, on_concurrency=on_concurrency)
     else:
         def on_start(vidx):
             print(f"⬇ 开始下载 卷{vidx}", flush=True)
@@ -213,9 +230,12 @@ def _run_pipeline_with_progress(downloader: Downloader, book: Book, volumes,
         def on_done(vidx, path):
             print(f"✓ 完成 卷{vidx}：{path.name if path else '无内容'}", flush=True)
 
+        def on_concurrency(n):
+            print(f"🧵 并发线程：{n}", flush=True)
+
         return downloader.run_pipeline(
             book, volumes, temp_dir, out_dir, build_fn,
-            on_start=on_start, on_done=on_done)
+            on_start=on_start, on_done=on_done, on_concurrency=on_concurrency)
 
 
 def _print_help() -> None:

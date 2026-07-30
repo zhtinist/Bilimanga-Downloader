@@ -44,6 +44,15 @@ def safe_name(name: str) -> str:
     return cleaned or "untitled"
 
 
+def cleanup_book_temp(temp_dir: Path, title: str) -> None:
+    """删除某本书的临时图片目录（异常/取消中断后清理，避免占盘）。"""
+    import shutil
+    try:
+        shutil.rmtree(Path(temp_dir) / safe_name(title), ignore_errors=True)
+    except Exception:  # noqa: BLE001
+        pass
+
+
 @dataclass
 class DownloadedChapter:
     title: str
@@ -70,7 +79,8 @@ class _Adaptive:
         0 < 错误率 < 40%   → -1（温和减）
     """
 
-    def __init__(self, start: int, lo: int, hi: int):
+    def __init__(self, start: int, lo: int, hi: int,
+                 on_change: Optional[Callable[[int], None]] = None):
         self.limit = max(lo, min(hi, start))
         self.lo, self.hi = lo, hi
         self._active = 0
@@ -79,8 +89,11 @@ class _Adaptive:
         self._stop = False
         self._cv = threading.Condition()
         self._mon: Optional[threading.Thread] = None
+        self._on_change = on_change
 
     def start(self):
+        if self._on_change:
+            self._on_change(self.limit)  # 先播报初始线程数
         self._mon = threading.Thread(target=self._loop, daemon=True)
         self._mon.start()
 
@@ -107,11 +120,13 @@ class _Adaptive:
     def _loop(self):
         while True:
             time.sleep(1.0)
+            changed = False
             with self._cv:
                 if self._stop:
                     return
                 total = self._ok + self._fail
                 if total > 0:
+                    old = self.limit
                     rate = self._fail / total
                     if rate == 0:
                         self.limit = min(self.hi, self.limit + 1)
@@ -121,7 +136,10 @@ class _Adaptive:
                         self.limit = max(self.lo, self.limit - 1)
                     self._ok = self._fail = 0
                     self._cv.notify_all()
+                    changed = self.limit != old
                     log.debug("并发调节: 上限=%d (本秒成功后清零)", self.limit)
+            if changed and self._on_change:
+                self._on_change(self.limit)
 
 
 class Downloader:
@@ -313,12 +331,14 @@ class Downloader:
         on_image: Optional[Callable] = None,
         on_phase: Optional[Callable] = None,
         on_done: Optional[Callable] = None,
+        on_concurrency: Optional[Callable] = None,
     ) -> List[Path]:
         """逐卷串行下载 + 校对/打包后台重叠。每卷一条进度：下载→校对→打包→完成。
 
-        - 下载：一次只下一卷（其余等待），卷内多图并发，AIMD 按网络自适应并发。
+        - 下载：一次只下一卷（其余等待），卷内多图并发，AIMD 从 4 线程起步按网络自适应。
         - 下完立即交给后台线程做本地校对(查缺失/空文件，不联网) + 打包，
           与下一卷的下载重叠进行，逐卷产出 EPUB/PDF。
+        - 无论正常结束还是中途异常，都在 finally 里停调节器、关线程池（不泄漏线程）。
 
         回调（均可选，参数首位为卷号 vidx）：
           on_start(vidx)         该卷开始下载
@@ -326,15 +346,16 @@ class Downloader:
           on_image(vidx)         该卷下载完成一张
           on_phase(vidx, phase)  阶段变化：'validate' / 'package'
           on_done(vidx, path)    该卷完成，path 为成品路径（失败为 None）
+          on_concurrency(n)      当前并发线程数变化（初始 4，自适应升降）
         """
         base = book.base_url
         book_dir = temp_dir / safe_name(book.title)
         book_dir.mkdir(parents=True, exist_ok=True)
 
-        ceiling = max(2, self.config.parallel_chapters)
-        limiter = _Adaptive(start=min(ceiling, 4), lo=2, hi=min(ceiling, 8))
+        # 线程数：固定从 4 起步，自适应在 [2, 8] 间升降（不再受用户配置的手填值影响）。
+        limiter = _Adaptive(start=4, lo=2, hi=8, on_change=on_concurrency)
         limiter.start()  # 启动每秒错误率采样的并发调节器
-        img_pool = ThreadPoolExecutor(max_workers=max(2, min(ceiling, 8)))
+        img_pool = ThreadPoolExecutor(max_workers=8)
         pkg_pool = ThreadPoolExecutor(max_workers=2)  # 后台校对+打包
         outputs: list = []
         out_lock = threading.Lock()
@@ -380,65 +401,64 @@ class Downloader:
                 on_done(vidx, path)
 
         pkg_futures = []
-        # Agent1：逐卷串行下载
-        for v in volumes:
-            vd = book_dir / safe_name(f"{v.index:02d}_{v.title}")
-            vd.mkdir(parents=True, exist_ok=True)
-            dv = DownloadedVolume(volume=v, dir=vd, cover=None,
-                                  chapters=[DownloadedChapter(title=c.title) for c in v.chapters])
-            if on_start:
-                on_start(v.index)
-            # 扫描该卷所有话的图片 URL
-            tasks = []  # (url, dest, ref, ci, ii)
-            for ci, ch in enumerate(v.chapters):
-                try:
-                    urls = self.scraper.fetch_chapter_images(ch, base)
-                except Exception as exc:
-                    log.warning("解析话 %r 失败: %s", ch.title, exc)
-                    urls = []
-                dchap = dv.chapters[ci]
-                dchap.images = [vd / f"{ci:03d}_{ii:04d}.jpg" for ii in range(len(urls))]
-                for ii, u in enumerate(urls):
-                    tasks.append((u, dchap.images[ii], ch.url))
-            if on_total:
-                on_total(v.index, len(tasks))
-
-            # 卷内多图并发下载（受 AIMD 限流器节流）
-            done_cnt = [0]
-            dlock = threading.Lock()
-
-            def _one(t):
-                ok = _fetch(t[0], t[1], t[2])
-                if ok and on_image:
-                    on_image(v.index)
-                return t, ok
-
-            pending = list(tasks)
-            for _round in range(4):
-                if not pending:
-                    break
-                futs = [img_pool.submit(_one, t) for t in pending]
-                for f in futs:
+        try:
+            # Agent1：逐卷串行下载
+            for v in volumes:
+                vd = book_dir / safe_name(f"{v.index:02d}_{v.title}")
+                vd.mkdir(parents=True, exist_ok=True)
+                dv = DownloadedVolume(volume=v, dir=vd, cover=None,
+                                      chapters=[DownloadedChapter(title=c.title) for c in v.chapters])
+                if on_start:
+                    on_start(v.index)
+                # 扫描该卷所有话的图片 URL
+                tasks = []  # (url, dest, ref, ci, ii)
+                for ci, ch in enumerate(v.chapters):
                     try:
-                        f.result()
-                    except Exception:
-                        pass
-                pending = [t for t in tasks if not self._valid_file(t[1])]
-                if pending:
-                    time.sleep(1.0)  # 退避后重试缺失
+                        urls = self.scraper.fetch_chapter_images(ch, base)
+                    except Exception as exc:
+                        log.warning("解析话 %r 失败: %s", ch.title, exc)
+                        urls = []
+                    dchap = dv.chapters[ci]
+                    dchap.images = [vd / f"{ci:03d}_{ii:04d}.jpg" for ii in range(len(urls))]
+                    for ii, u in enumerate(urls):
+                        tasks.append((u, dchap.images[ii], ch.url))
+                if on_total:
+                    on_total(v.index, len(tasks))
 
-            # 下完 → 交后台校对+打包（与下一卷下载重叠）
-            pkg_futures.append(pkg_pool.submit(_finalize, v.index, dv))
+                def _one(t, vidx=v.index):
+                    ok = _fetch(t[0], t[1], t[2])
+                    if ok and on_image:
+                        on_image(vidx)
+                    return t, ok
 
-        for f in pkg_futures:
-            try:
-                f.result()
-            except Exception:
-                pass
-        limiter.stop()
-        img_pool.shutdown(wait=False)
-        pkg_pool.shutdown(wait=True)
-        return outputs
+                pending = list(tasks)
+                for _round in range(4):
+                    if not pending:
+                        break
+                    futs = [img_pool.submit(_one, t) for t in pending]
+                    for f in futs:
+                        try:
+                            f.result()
+                        except Exception:
+                            pass
+                    pending = [t for t in tasks if not self._valid_file(t[1])]
+                    if pending:
+                        time.sleep(1.0)  # 退避后重试缺失
+
+                # 下完 → 交后台校对+打包（与下一卷下载重叠）
+                pkg_futures.append(pkg_pool.submit(_finalize, v.index, dv))
+
+            for f in pkg_futures:
+                try:
+                    f.result()
+                except Exception:
+                    pass
+            return outputs
+        finally:
+            # 无论正常/异常/中断，都收好线程池与调节器，避免线程与内存泄漏。
+            limiter.stop()
+            img_pool.shutdown(wait=False)
+            pkg_pool.shutdown(wait=True)
 
 
     @staticmethod

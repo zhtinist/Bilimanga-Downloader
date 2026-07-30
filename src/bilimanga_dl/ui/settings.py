@@ -8,19 +8,14 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from ..config import Config, DEFAULT_SITE, default_download_dir
+from ..config import Config, default_download_dir
 
 
 def open_settings(config: Config, use_terminal: bool = True) -> None:
     """终端逐项修改设置。``use_terminal`` 仅为兼容旧签名。"""
     print("\n===== 设置（直接回车保留当前值）=====")
 
-    cur_site = config.site_url or DEFAULT_SITE
-    v = input(f"站点地址 [{cur_site}]（如 {DEFAULT_SITE}）: ").strip()
-    if v:
-        if not v.startswith("http"):
-            v = "https://" + v
-        config.site_url = v.rstrip("/")
+    print(f"站点地址：{config.site}（固定，不支持修改）")
 
     cur_out = config.output_dir or f"浏览器下载目录 {default_download_dir()}"
     print(f"下载输出目录 [{cur_out}]（留空=用浏览器下载目录；输入 none 清空恢复默认）:")
@@ -38,9 +33,7 @@ def open_settings(config: Config, use_terminal: bool = True) -> None:
     v = input(f"默认格式 epub/pdf [{config.default_format}]: ").strip().lower()
     if v in ("epub", "pdf"):
         config.default_format = v
-    v = input(f"并发数（同时下载几话）[{config.parallel_chapters}]: ").strip()
-    if v.isdigit() and int(v) > 0:
-        config.parallel_chapters = int(v)
+    # 并发线程数不再手填：固定 4 起步、自适应升降。
     cur_proxy = config.proxy or "自动(用环境变量，连不上自动直连)"
     v = input(f"代理 [{cur_proxy}]（输入 none 表示强制直连；直接回车不改）: ").strip()
     if v.lower() == "none":

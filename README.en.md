@@ -63,11 +63,13 @@ The CLI download is 4 steps: **confirm → parse catalog → pick chapters (e.g.
 
 In the GUI "① Settings" panel, or `--cli` → Settings:
 
-- **Site URL** — defaults to `https://www.bilimanga.net`, editable (no more built-in mirror fallback, so it
+- **Site URL** — fixed to `https://www.bilimanga.net` (shown only, not editable; no mirror fallback, so it
   never silently connects to a different site).
 - **Output folder** — defaults to your **browser's Downloads folder** (`~/Downloads`); change it to any
   folder (output is grouped by book title).
-- Default format (EPUB/PDF), concurrency, proxy, rate-limit / backoff-retry / resume, debug logging, etc.
+- **Download threads** — fixed to start at 4 and auto-adjust to the network (the UI shows the current
+  thread count live); no manual setting.
+- Default format (EPUB/PDF), proxy, rate-limit / backoff-retry / resume, debug logging, etc.
 
 Settings and logs live in the project dir when run from source, or in the OS app-data dir when packaged
 (macOS `~/Library/Application Support/Bilimanga-Downloader`, Windows `%APPDATA%\Bilimanga-Downloader`).

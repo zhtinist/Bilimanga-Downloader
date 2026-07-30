@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Bilimanga 漫画下载器
 // @namespace    https://github.com/zhtinist/Bilimanga-Downloader
-// @version      1.1.0
+// @version      1.1.1
 // @description  在 bilimanga 漫画页面里一键把整卷下载成 EPUB / PDF，无需安装 Python 环境。
 // @author       HTZHU
 // @license      MIT
@@ -729,7 +729,7 @@
   // =====================================================================
   // 八、并发池 + 逐卷处理
   // =====================================================================
-  const IMAGE_CONCURRENCY = 5;
+  const IMAGE_CONCURRENCY = 4;
 
   async function runPool(items, limit, worker) {
     let idx = 0;
@@ -752,72 +752,91 @@
     prog.setState("解析话列表…");
     // 并发解析各话的图片地址（限流 4，兼顾速度与不触发 Cloudflare 限速）；
     // 按原顺序写回，保证阅读顺序不乱。
-    const chapterData = new Array(vol.chapters.length);
-    await runPool(
-      vol.chapters.map((chap, i) => ({ chap, i })),
-      4,
-      async ({ chap, i }) => {
-        const urls = await fetchChapterImages(chap.url, book.base);
-        chapterData[i] = { title: chap.title, urls, images: new Array(urls.length).fill(null) };
-      }
-    );
-    const total = chapterData.reduce((s, c) => s + c.urls.length, 0);
-    if (total === 0) {
-      prog.error("未解析到图片");
-      return;
-    }
+    let chapterData = new Array(vol.chapters.length);
 
-    prog.setState(`下载中 0/${total}`);
-    const tasks = [];
-    chapterData.forEach((c, ci) => c.urls.forEach((u, ii) => tasks.push({ ci, ii, url: u })));
-
-    let done = 0;
-    const fetchOne = async (t) => {
-      // 单张最多试 3 次（网络抖动/429 常是暂时性），失败留 null 由补漏轮兜底
-      for (let attempt = 0; attempt < 3; attempt++) {
-        try {
-          chapterData[t.ci].images[t.ii] = await fetchImageAsJpeg(t.url);
-          return;
-        } catch (e) {
-          if (attempt < 2) await sleep(500 * (attempt + 1));
-        }
+    // 释放已解码图片占用的内存（每张是较大的 JPEG Uint8Array）。无论正常完成、
+    // 报错还是中途中断，都在 finally 里调用，避免内存随着多卷连下不断累积。
+    const release = () => {
+      if (!chapterData) return;
+      for (const c of chapterData) {
+        if (c && c.images) c.images.length = 0;
       }
+      chapterData = null;
     };
-    await runPool(tasks, IMAGE_CONCURRENCY, async (t) => {
-      await fetchOne(t);
-      done += 1;
-      prog.setRatio(done / total);
-      prog.setState(`下载中 ${done}/${total}`);
-    });
 
-    // 补漏轮：仍缺失的再单线程重试一遍，尽量补齐（同命令行版的“最终补齐”）
-    const missing = tasks.filter((t) => !chapterData[t.ci].images[t.ii]);
-    if (missing.length) {
-      prog.setState(`补漏 ${missing.length} 张…`);
-      for (const t of missing) await fetchOne(t);
+    try {
+      await runPool(
+        vol.chapters.map((chap, i) => ({ chap, i })),
+        4,
+        async ({ chap, i }) => {
+          const urls = await fetchChapterImages(chap.url, book.base);
+          chapterData[i] = { title: chap.title, urls, images: new Array(urls.length).fill(null) };
+        }
+      );
+      const total = chapterData.reduce((s, c) => s + c.urls.length, 0);
+      if (total === 0) {
+        prog.error("未解析到图片");
+        return;
+      }
+
+      prog.setState(`下载中 0/${total}`);
+      const tasks = [];
+      chapterData.forEach((c, ci) => c.urls.forEach((u, ii) => tasks.push({ ci, ii, url: u })));
+
+      let done = 0;
+      const fetchOne = async (t) => {
+        // 单张最多试 3 次（网络抖动/429 常是暂时性），失败留 null 由补漏轮兜底
+        for (let attempt = 0; attempt < 3; attempt++) {
+          try {
+            chapterData[t.ci].images[t.ii] = await fetchImageAsJpeg(t.url);
+            return;
+          } catch (e) {
+            if (attempt < 2) await sleep(500 * (attempt + 1));
+          }
+        }
+      };
+      await runPool(tasks, IMAGE_CONCURRENCY, async (t) => {
+        await fetchOne(t);
+        done += 1;
+        prog.setRatio(done / total);
+        prog.setState(`下载中 ${done}/${total}`);
+      });
+
+      // 补漏轮：仍缺失的再单线程重试一遍，尽量补齐（同命令行版的“最终补齐”）
+      const missing = tasks.filter((t) => !chapterData[t.ci].images[t.ii]);
+      if (missing.length) {
+        prog.setState(`补漏 ${missing.length} 张…`);
+        for (const t of missing) await fetchOne(t);
+      }
+
+      const chapters = chapterData.map((c) => ({ title: c.title, images: c.images.filter(Boolean) }));
+      if (!chapters.some((c) => c.images.length > 0)) {
+        prog.error("图片全部下载失败");
+        return;
+      }
+
+      prog.setState("打包中…");
+      let bytes;
+      let ext;
+      if (fmt === "pdf") {
+        const flat = [];
+        chapters.forEach((c) => c.images.forEach((im) => flat.push(im)));
+        bytes = buildPdf(flat);
+        ext = "pdf";
+      } else {
+        bytes = buildEpub(book, vol, chapters);
+        ext = "epub";
+      }
+
+      // 打包字节已生成，解码图片可以立刻释放，降低多卷连下时的内存峰值
+      chapters.length = 0;
+      release();
+      saveFile(bytes, safeName(`${book.title} - ${vol.title}`) + "." + ext, ext);
+      bytes = null;
+      prog.done();
+    } finally {
+      release();
     }
-
-    const chapters = chapterData.map((c) => ({ title: c.title, images: c.images.filter(Boolean) }));
-    if (!chapters.some((c) => c.images.length > 0)) {
-      prog.error("图片全部下载失败");
-      return;
-    }
-
-    prog.setState("打包中…");
-    let bytes;
-    let ext;
-    if (fmt === "pdf") {
-      const flat = [];
-      chapters.forEach((c) => c.images.forEach((im) => flat.push(im)));
-      bytes = buildPdf(flat);
-      ext = "pdf";
-    } else {
-      bytes = buildEpub(book, vol, chapters);
-      ext = "epub";
-    }
-
-    saveFile(bytes, safeName(`${book.title} - ${vol.title}`) + "." + ext, ext);
-    prog.done();
   }
 
   // =====================================================================
