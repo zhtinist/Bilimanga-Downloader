@@ -5,8 +5,8 @@
 A manga downloader for [bilimanga.net](https://www.bilimanga.net/): scrapes the artwork and packages each
 volume into **EPUB** or **PDF**.
 
-> **The command-line / desktop app (this repo) is the recommended way.** It ships a built-in GUI (a local
-> web UI) and also works purely from the terminal — most stable.
+> **The command-line / desktop app (this repo) is the recommended way.** It ships a built-in **native GUI
+> window** (no browser, no local server) and also works purely from the terminal — most stable.
 > The 🐵 userscript ([`userscript/`](userscript)) is **currently unstable** (breaks easily due to site
 > DOM changes, cross-origin prompts and browser differences); keep it only as a fallback and switch back
 > to this repo if it misbehaves.
@@ -18,7 +18,7 @@ volume into **EPUB** or **PDF**.
 | For | non-technical users, zero setup | terminal users / hackers | don't want to install anything |
 | Runtime | **no Python**, just local Chrome/Edge | Python + local Chrome/Edge | browser + Tampermonkey |
 | Get it | download for your OS from [Releases](../../releases), double-click | `python3 start.py` | install Tampermonkey → install script |
-| UI | double-click opens a **GUI** (web UI) | GUI by default, `--cli` for terminal | floating button on the page |
+| UI | double-click opens a **native window** | native window by default, `--cli` for terminal | floating button on the page |
 | Platform | macOS / Windows | macOS / Windows | any |
 
 ## 1. Double-click executable (recommended, no Python)
@@ -26,8 +26,9 @@ volume into **EPUB** or **PDF**.
 1. Download for your OS from [Releases](../../releases):
    - **macOS**: `Bilimanga-Downloader-macOS.zip` → unzip → double-click `Bilimanga-Downloader.app`.
    - **Windows**: `Bilimanga-Downloader-Windows.zip` → unzip → double-click `Bilimanga-Downloader.exe`.
-2. It opens a **GUI** in your browser automatically (`http://127.0.0.1:8765`).
-3. In the UI: paste a book URL or id and click Parse → tick the volumes → Download. Files go to your
+2. It opens a **native app window** (no browser, no local server — so macOS won't keep prompting to
+   "allow incoming network connections").
+3. In the window: paste a book URL or id and click Parse → tick the volumes → Download. Files go to your
    **browser's Downloads folder** (`~/Downloads`) by default; change it anytime in "① Settings".
 
 > Requires **Chrome or Edge** installed locally (used to pass Cloudflare). The first parse launches the
@@ -37,7 +38,7 @@ volume into **EPUB** or **PDF**.
 ## 2. CLI / from source
 
 ```bash
-python3 start.py            # launches the GUI (local web UI) by default
+python3 start.py            # launches the native GUI window by default
 python3 start.py --cli      # interactive terminal menu
 python3 start.py https://www.bilimanga.net/detail/54.html   # detail URL, download directly
 python3 start.py 54                                         # book id, download directly
@@ -85,7 +86,7 @@ Bilimanga-Downloader/
 ├── packaging/            # PyInstaller scripts & GitHub Actions workflow
 ├── src/
 │   ├── requirements.txt
-│   └── bilimanga_dl/     # source (net / scraper / downloader / build_* / cli / webui / ui …)
+│   └── bilimanga_dl/     # source (net / scraper / downloader / build_* / cli / gui / ui …)
 ├── userscript/           # 🐵 userscript build (fallback, unstable)
 └── (generated at runtime) config / logs / temp / your output folder
 ```

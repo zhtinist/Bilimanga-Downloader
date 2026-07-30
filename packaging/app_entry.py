@@ -1,4 +1,4 @@
-"""打包后可执行文件的入口：启动本地网页 UI（双击即用，不依赖本地 Python）。
+"""打包后可执行文件的入口：启动原生图形界面（双击即用，不依赖本地 Python）。
 
 - 打包环境（PyInstaller，``sys.frozen``）：``bilimanga_dl`` 已随包内置，直接导入。
 - 从源码直接跑本文件（调试打包逻辑）：把仓库的 ``src`` 加入模块搜索路径。
@@ -20,13 +20,12 @@ def _bootstrap_path() -> None:
 def main() -> int:
     _bootstrap_path()
     from bilimanga_dl.config import Config
+    from bilimanga_dl.gui import run
     from bilimanga_dl.logutil import debug_requested, setup_logging
-    from bilimanga_dl.webui import serve
 
     config = Config.load()
     setup_logging(debug_requested(config.debug))
-    serve(config, open_browser=True)
-    return 0
+    return run(config)
 
 
 def _report_crash(text: str) -> None:

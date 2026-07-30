@@ -7,12 +7,12 @@
 - 命令行只负责"准备环境 + 启动"这一步。
 
 用法:
-    python3 start.py                 # 准备环境并启动图形界面(本地网页 UI)
+    python3 start.py                 # 准备环境并启动原生图形界面(独立窗口)
     python3 start.py --cli           # 交互式命令行菜单
     python3 start.py <URL>           # 直接下载指定漫画
     python3 start.py --debug         # 开调试日志
 
-默认启动图形界面(浏览器打开 http://127.0.0.1:8765);加 --cli 走纯命令行。
+默认启动原生图形界面(Tkinter 独立窗口,不开浏览器、不起本地服务);加 --cli 走纯命令行。
 """
 
 import os

@@ -73,4 +73,4 @@ jobs:
               首次打开若被 Gatekeeper 拦，在「系统设置 → 隐私与安全性」点「仍要打开」。
             - Windows：下载 `Bilimanga-Downloader-Windows.zip`，解压后双击 `Bilimanga-Downloader.exe`。
 
-            启动后会自动打开图形界面（`http://127.0.0.1:8765`）。首次使用请先在「设置」里填写“下载输出目录”。
+            启动后打开一个独立的原生程序窗口（不开浏览器、不起本地服务）。下载目录默认用系统下载文件夹 `~/Downloads`，可在「设置」里修改。

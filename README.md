@@ -4,7 +4,7 @@
 
 [bilimanga.net](https://www.bilimanga.net/) 漫画下载器：抓取漫画插图，按卷/话下载并打包为 **EPUB** 或 **PDF**。
 
-> **推荐使用命令行 / 本地应用版（本仓库主体）。** 它自带图形界面（本地网页 UI），也可纯命令行使用，最稳定。
+> **推荐使用命令行 / 本地应用版（本仓库主体）。** 它自带**原生图形界面**（独立程序窗口，不开浏览器、不起本地服务），也可纯命令行使用，最稳定。
 > 🐵 油猴脚本版（[`userscript/`](userscript)）**目前不稳定**（受站点结构变动、跨域授权、浏览器差异影响，容易失效），仅作备用，遇到问题请改用本仓库主体。
 
 ## 三种使用方式（按推荐程度排列）
@@ -14,7 +14,7 @@
 | 面向 | 电脑小白，零环境 | 会用命令行 / 想改代码 | 不想装东西且能接受偶发失效 |
 | 环境 | **无需 Python**，只需本机 Chrome/Edge | Python + 本机 Chrome/Edge | 浏览器 + Tampermonkey |
 | 获取 | 到 [Releases](../../releases) 下载对应系统的文件，双击即用 | `python3 start.py` | 商店装 Tampermonkey → 装脚本 |
-| 界面 | 双击自动打开**图形界面**（网页 UI） | 默认图形界面，`--cli` 走终端 | 页面右侧浮动按钮 |
+| 界面 | 双击打开**原生窗口**（不用浏览器） | 默认原生窗口，`--cli` 走终端 | 页面右侧浮动按钮 |
 | 平台 | macOS / Windows | macOS / Windows | 通用 |
 
 ## 一、双击可执行文件（推荐，无需 Python）
@@ -22,8 +22,8 @@
 1. 到 [Releases](../../releases) 下载对应系统的文件：
    - **macOS**：`Bilimanga-Downloader-macOS.zip`（解压后得到 `Bilimanga-Downloader.app`，双击运行）。
    - **Windows**：`Bilimanga-Downloader-Windows.zip`（解压后双击 `Bilimanga-Downloader.exe`）。
-2. 双击后会自动在浏览器打开**图形界面**（地址 `http://127.0.0.1:8765`）。
-3. 在界面里：粘贴漫画链接或书号点「解析」→ 勾选要下的章 → 「开始下载」。文件默认存到**浏览器下载目录**（`~/Downloads`），也可在「① 设置」里改成任意目录。
+2. 双击后打开一个**独立的程序窗口**（原生界面，不开浏览器、不起本地服务，因此不会触发 macOS「允许接受传入网络连接」的反复弹窗）。
+3. 在窗口里：粘贴漫画链接或书号点「解析」→ 勾选要下的章 → 「开始下载」。文件默认存到**浏览器下载目录**（`~/Downloads`），也可在「① 设置」里改成任意目录。
 
 > 前提：本机需装有 **Chrome 或 Edge**（用来过 Cloudflare）。首次解析会启动一次浏览器，约 10–20 秒。
 > macOS 首次打开若提示“无法验证开发者”，在「系统设置 → 隐私与安全性」里点「仍要打开」即可。
@@ -31,7 +31,7 @@
 ## 二、命令行 / 源码运行
 
 ```bash
-python3 start.py            # 默认启动图形界面（本地网页 UI）
+python3 start.py            # 默认启动原生图形界面（独立窗口）
 python3 start.py --cli      # 交互式命令行菜单
 python3 start.py https://www.bilimanga.net/detail/54.html   # 详情页链接，直接下载
 python3 start.py 54                                         # 书号，直接下载
@@ -74,7 +74,7 @@ Bilimanga-Downloader/
 ├── packaging/            # 打包脚本（PyInstaller）与 GitHub Actions 工作流
 ├── src/
 │   ├── requirements.txt
-│   └── bilimanga_dl/     # 源码（net / scraper / downloader / build_* / cli / webui / ui …）
+│   └── bilimanga_dl/     # 源码（net / scraper / downloader / build_* / cli / gui / ui …）
 ├── userscript/           # 🐵 油猴脚本版（备用，不稳定）
 └── （运行时生成）config / logs / temp / 你设置的输出目录
 ```

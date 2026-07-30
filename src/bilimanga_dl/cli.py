@@ -220,7 +220,7 @@ def _run_pipeline_with_progress(downloader: Downloader, book: Book, volumes,
 
 def _print_help() -> None:
     _print("用法：")
-    _print("  python3 start.py                启动图形界面（本地网页 UI）")
+    _print("  python3 start.py                启动原生图形界面（独立窗口）")
     _print("  python3 start.py --cli          进入交互式命令行菜单")
     _print("  python3 start.py <URL>          直接下载指定漫画")
     _print("  python3 start.py --debug        开启调试日志")
@@ -261,11 +261,13 @@ def main(argv: Optional[List[str]] = None) -> int:
         run_download(config, argv[0])
         return 0
 
-    # 无 URL 参数：默认启动图形界面；--cli 才进终端菜单
+    # 无 URL 参数：默认启动原生图形界面；--cli 才进终端菜单
     if not force_cli:
-        from .webui import serve
-        serve(config)
-        return 0
+        try:
+            from .gui import run as gui_run
+            return gui_run(config)
+        except Exception as exc:  # noqa: BLE001 —— 无显示环境等，退回终端菜单
+            _print(f"[yellow]图形界面无法启动（{exc}），改用命令行菜单。[/yellow]")
 
     # 交互式菜单
     while True:
