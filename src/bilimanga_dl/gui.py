@@ -461,7 +461,8 @@ class DownloaderGUI:
                         book, v, target,
                         on_phase=lambda vi, ph: q.put(("v_phase", vi, ph)),
                         on_total=lambda vi, n: q.put(("v_total", vi, n)),
-                        on_image=lambda vi: q.put(("v_image", vi)))
+                        on_image=lambda vi: q.put(("v_image", vi)),
+                        on_concurrency=lambda vi, n: q.put(("concurrency", n)))
                     q.put(("v_done", v.index, path.name if path else ""))
                 q.put(("all_done", str(target)))
                 return

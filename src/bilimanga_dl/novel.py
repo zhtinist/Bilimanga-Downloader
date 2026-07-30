@@ -102,13 +102,14 @@ def _container_xml() -> str:
 
 
 def _cover_xhtml(w: int, h: int) -> str:
-    return (f'<?xml version="1.0" encoding="UTF-8"?>\n'
-            '<html xmlns="http://www.w3.org/1999/xhtml"><head><title>Cover</title></head>\n'
-            '<body style="margin:0;padding:0;text-align:center;">\n'
-            f'<svg xmlns="http://www.w3.org/2000/svg" height="100%" preserveAspectRatio="xMidYMid meet" '
-            f'version="1.1" viewBox="0 0 {w} {h}" width="100%" xmlns:xlink="http://www.w3.org/1999/xlink">\n'
-            '<image width="%d" height="%d" xlink:href="../Images/00.jpg"/></svg>\n'
-            '</body></html>' % (w, h))
+    return (
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        '<html xmlns="http://www.w3.org/1999/xhtml"><head><title>Cover</title></head>\n'
+        '<body style="margin:0;padding:0;text-align:center;">\n'
+        f'<svg xmlns="http://www.w3.org/2000/svg" height="100%" preserveAspectRatio="xMidYMid meet" '
+        f'version="1.1" viewBox="0 0 {w} {h}" width="100%" xmlns:xlink="http://www.w3.org/1999/xlink">\n'
+        f'<image width="{w}" height="{h}" xlink:href="../Images/00.jpg"/></svg>\n'
+        '</body></html>')
 
 
 def _text_xhtml(chap_name: str, body: str) -> str:
@@ -186,7 +187,9 @@ class NovelDownloader:
         return volumes
 
     # ---- 正文（多页 + 反混淆 + 抽图）----
-    def _page_text(self, html: str, img_map: dict) -> str:
+    # 图片先用带真实 URL 的占位标记，等所有章节抓完再按章节顺序统一编号，
+    # 这样章节文本可并发抓取而不打乱插图顺序（第一张仍是封面 00）。
+    def _page_text(self, html: str) -> str:
         obfuscated = "woff2" in html
         bf = BeautifulSoup(html, "html.parser")
         content = bf.find("div", {"id": "TextContent"})
@@ -200,24 +203,15 @@ class NovelDownloader:
                 e.decompose()
         text_html = re.sub(r"<!--(.*?)-->", "", str(content), flags=re.DOTALL)
 
-        # 抽取插图，重映射为本地 Images/NN.jpg；第一张(00)作封面不写正文
         for tag in re.findall(r"<img\s[^>]*>", text_html):
             m = re.search(r"[a-zA-Z]{3}/(.*?)\.(jpg|png|jpeg)", tag)
             if not m:
                 text_html = text_html.replace(tag, "")
                 continue
             img_url = f"{IMG_HOST}/{m.group(1)}.{m.group(2)}"
-            if img_url not in img_map:
-                img_map[img_url] = str(len(img_map)).zfill(2)
-            idx = img_map[img_url]
-            if idx == "00":
-                text_html = text_html.replace(tag, "")
-            else:
-                text_html = text_html.replace(
-                    tag, f'<img alt="{idx}" src="../Images/{idx}.jpg"/>')
+            text_html = text_html.replace(tag, f'<img class="__nv__" src="{img_url}"/>')
 
         content = BeautifulSoup(text_html, "html.parser").find("div", id="TextContent")
-        # 去掉反爬提示元素 <pNNN>
         for m in re.findall(r"<p(\d+)>", str(content)):
             el = content.find(f"p{m}")
             if el:
@@ -231,8 +225,8 @@ class NovelDownloader:
             body = _deobfuscate_last_p(body)
         return body
 
-    def _chap_text(self, chap: Chapter, img_map: dict) -> Tuple[str, bool]:
-        """返回 (正文 html, 是否疑似被登录/权限拦截)。"""
+    def _chap_text(self, chap: Chapter) -> Tuple[str, bool]:
+        """返回 (正文 html[含图片占位], 是否疑似被限流)。"""
         text = ""
         url = chap.url
         base_url = chap.url
@@ -242,45 +236,98 @@ class NovelDownloader:
             html = self.net.get_novel_text(url, referer=NOVEL_SITE)
             if any(m in html for m in _LOCK_MARKERS):
                 gated = True
-            text += self._page_text(html, img_map)
+            text += self._page_text(html)
             nxt = base_url.replace(".html", f"_{page + 1}.html")[len(NOVEL_SITE):]
             if nxt in html:
                 page += 1
                 url = NOVEL_SITE + nxt
+                time.sleep(0.3)  # 同章翻页间稍歇
             else:
                 break
         return text, gated
 
+    @staticmethod
+    def _assign_images(ordered_bodies):
+        """按章节顺序给占位图片统一编号，返回 (改写后的 bodies, img_map[url->idx])。
+
+        第一张(00)作封面，从正文中移除；其余改写为 ../Images/NN.jpg。
+        """
+        img_map: dict = {}
+        for body in ordered_bodies:
+            for url in re.findall(r'<img class="__nv__" src="([^"]+)"/>', body):
+                if url not in img_map:
+                    img_map[url] = str(len(img_map)).zfill(2)
+
+        def rewrite(body):
+            def repl(mm):
+                idx = img_map[mm.group(1)]
+                if idx == "00":
+                    return ""
+                return f'<img alt="{idx}" src="../Images/{idx}.jpg"/>'
+            return re.sub(r'<img class="__nv__" src="([^"]+)"/>', repl, body)
+
+        return [rewrite(b) for b in ordered_bodies], img_map
+
     def download_volume(self, book: Book, volume: Volume, out_dir: Path,
                         on_phase: Optional[Callable] = None,
                         on_total: Optional[Callable] = None,
-                        on_image: Optional[Callable] = None) -> Optional[Path]:
-        """下载一卷 → 生成一个 EPUB，返回路径（无内容返回 None）。"""
+                        on_image: Optional[Callable] = None,
+                        on_concurrency: Optional[Callable] = None) -> Optional[Path]:
+        """下载一卷 → 生成一个 EPUB，返回路径（无内容返回 None）。
+
+        章节文本用**自适应多线程**并发抓取（和漫画一样：4 起步、按限流自动升降，
+        界面实时显示当前线程数）；抓完再按章节顺序统一给插图编号，保证顺序正确。
+        """
+        from .downloader import _Adaptive
+
         vidx = volume.index
         if on_phase:
             on_phase(vidx, "download")
-        img_map: dict = {}
-        chapters_out: List[Tuple[str, str]] = []  # (chap_name, body_html)
-        any_gated = False
-        for chap in volume.chapters:
-            if "javascript" in chap.url or "cid" in chap.url:
-                log.warning("跳过失效章节链接：%s", chap.title)
-                continue
+
+        # 有效章节（跳过失效链接），保持顺序
+        jobs = [(i, ch) for i, ch in enumerate(volume.chapters)
+                if "javascript" not in ch.url and "cid" not in ch.url]
+        names = [ch.title for _, ch in jobs]
+        bodies: dict = {}          # i -> body_html（含图片占位）
+        gated_flags: dict = {}
+        # 轻小说站点(linovelib)对并发很敏感，太猛会触发限流反而更慢；因此比漫画更温和：
+        # 2 起步、自适应在 [1,4] 间升降（限流即退，顺畅才加）。
+        limiter = _Adaptive(start=2, lo=1, hi=4,
+                            on_change=(lambda n: on_concurrency(vidx, n)) if on_concurrency else None)
+        limiter.start()
+
+        def _fetch(job):
+            i, ch = job
+            limiter.acquire()
+            ok = False
             try:
-                body, gated = self._chap_text(chap, img_map)
-                any_gated = any_gated or gated
+                body, gated = self._chap_text(ch)
+                bodies[i] = body
+                gated_flags[i] = gated
+                ok = bool(body.strip()) and not gated
             except Exception as exc:  # noqa: BLE001
-                log.warning("章节 %r 抓取失败：%s", chap.title, exc)
-                body = ""
-            chapters_out.append((chap.title, body))
-            time.sleep(0.6)  # 章节间稍作停顿，避免触发 linovelib 限流
+                log.warning("章节 %r 抓取失败：%s", ch.title, exc)
+                bodies[i] = ""
+            finally:
+                limiter.release(ok)
+
+        try:
+            with ThreadPoolExecutor(max_workers=4) as pool:
+                list(pool.map(_fetch, jobs))
+        finally:
+            limiter.stop()
+
+        ordered = [bodies.get(i, "") for i, _ in jobs]
+        ordered, img_map = self._assign_images(ordered)
+        chapters_out: List[Tuple[str, str]] = list(zip(names, ordered))
+        any_gated = any(gated_flags.values())
 
         has_text = any(b.strip() for _, b in chapters_out)
         if not has_text and len(img_map) <= 1:
             if any_gated:
                 raise NovelRateLimited(
                     "linovelib 暂时限制了访问（返回占位页，通常是请求过于频繁）。"
-                    "已自动退避重试仍未成功，请**稍等几分钟再重试**；无需登录。")
+                    "已自动退避重试仍未成功，请稍等几分钟再重试；无需登录。")
             if on_phase:
                 on_phase(vidx, "empty")
             return None

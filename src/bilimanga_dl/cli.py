@@ -198,7 +198,11 @@ def _run_novel_download(net: Net, book: Book, volumes, out_dir):
             label = {"download": "下载文本/插图", "package": "打包", "empty": "无内容"}.get(ph, ph)
             _print(f"    {label}")
 
-        path = nd.download_volume(book, v, out_dir, on_phase=on_phase)
+        def on_concurrency(vi, n):
+            _print(f"    🧵 并发线程：{n}")
+
+        path = nd.download_volume(book, v, out_dir, on_phase=on_phase,
+                                  on_concurrency=on_concurrency)
         if path:
             outputs.append(path)
             _print(f"[green]✓ 完成[/green] {path.name}")

@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         Bilimanga 漫画下载器
+// @name         Bilimanga 漫画/轻小说下载器
 // @namespace    https://github.com/zhtinist/Bilimanga-Downloader
-// @version      1.1.1
-// @description  在 bilimanga 漫画页面里一键把整卷下载成 EPUB / PDF，无需安装 Python 环境。
+// @version      2.0.0
+// @description  在 bilimanga 漫画 / linovelib 轻小说页面里一键把整卷下载成 EPUB / PDF。
 // @author       HTZHU
 // @license      MIT
 // @homepageURL  https://github.com/zhtinist/Bilimanga-Downloader
@@ -10,6 +10,8 @@
 // @icon         https://www.bilimanga.net/favicon.ico
 // @match        https://www.bilimanga.net/*
 // @match        https://www.bilicomic.net/*
+// @match        https://www.linovelib.com/*
+// @require      https://raw.githubusercontent.com/zhtinist/Bilimanga-Downloader/main/userscript/rubbish_secret_map.js
 // @grant        GM_download
 // @grant        GM_xmlhttpRequest
 // @grant        GM_addStyle
@@ -214,6 +216,247 @@
       volumes.push({ index, title, chapters });
     });
     return volumes;
+  }
+
+  // ===================================================================
+  // 二·B、轻小说（linovelib）解析 —— 与命令行版 novel.py 逻辑一致
+  // ===================================================================
+  const NOVEL_IMG_HOST = "https://img3.readpai.com";
+  const NOVEL_PUNCT = "，。！？、；：“”‘’（）《》〈〉【】『』〖〗…—～＋－＝×÷·「」　 ";
+
+  function isNovelPath() {
+    return /\/novel\/\d+/.test(location.pathname);
+  }
+
+  function deobfuscateLastP(bodyHtml) {
+    const map = window.RUBBISH_MAP || {};
+    const doc = parseDoc(`<div id="__w">${bodyHtml}</div>`);
+    const ps = Array.from(doc.querySelectorAll("p"));
+    if (!ps.length) return bodyHtml;
+    let target = null;
+    for (let i = ps.length - 1; i >= Math.max(ps.length - 11, 0); i--) {
+      if (ps[i].textContent.trim()) { target = ps[i]; break; }
+    }
+    if (!target) return bodyHtml;
+    let out = "";
+    for (const ch of target.textContent) {
+      if (map[ch] !== undefined) out += map[ch];
+      else if (NOVEL_PUNCT.includes(ch)) out += ch;
+    }
+    target.textContent = out;
+    return doc.querySelector("#__w").innerHTML;
+  }
+
+  function pageTextNovel(html) {
+    const obf = html.includes("woff2");
+    const doc = parseDoc(html);
+    const content = doc.querySelector("#TextContent");
+    if (!content) return "";
+    content.querySelectorAll("#show-more-images,#hidden-images,.google-auto-placed,.ap_container,.dag")
+      .forEach((e) => e.remove());
+    let textHtml = content.innerHTML.replace(/<!--[\s\S]*?-->/g, "");
+    // 插图 → 占位标记（真实 URL），稍后统一编号
+    textHtml = textHtml.replace(/<img\s[^>]*>/g, (tag) => {
+      const m = tag.match(/[a-zA-Z]{3}\/(.*?)\.(jpg|png|jpeg)/);
+      if (!m) return "";
+      return `<img class="__nv__" src="${NOVEL_IMG_HOST}/${m[1]}.${m[2]}"/>`;
+    });
+    const c2 = parseDoc(`<div id="TextContent">${textHtml}</div>`).querySelector("#TextContent");
+    const warn = c2.innerHTML.match(/<p(\d+)>/);
+    if (warn) { const el = c2.querySelector("p" + warn[1]); if (el) el.remove(); }
+    let body = c2.innerHTML.replace(/^\n+/, "").replace(/\n+$/, "");
+    const cut = body.indexOf("————————————以下为告示");
+    if (cut !== -1) {
+      const lt = body.lastIndexOf("<", cut);
+      body = body.slice(0, lt !== -1 ? lt : cut);
+    }
+    if (obf) body = deobfuscateLastP(body);
+    return body;
+  }
+
+  async function fetchChapterTextNovel(chapUrl, base) {
+    let text = "", url = chapUrl, page = 1;
+    while (true) {
+      const html = await fetchText(url);
+      text += pageTextNovel(html);
+      const nxt = chapUrl.replace(".html", `_${page + 1}.html`).slice(base.length);
+      if (html.includes(nxt)) { page += 1; url = base + nxt; await sleep(300); }
+      else break;
+    }
+    return text;
+  }
+
+  async function fetchCatalogNovel(bookNo, base) {
+    const html = await fetchText(`${base}/novel/${bookNo}/catalog`);
+    const doc = parseDoc(html);
+    const volumes = [];
+    doc.querySelectorAll("div.volume.clearfix").forEach((v, i) => {
+      const title = textOf(v.querySelector("h2.v-line")) || `第${i + 1}卷`;
+      const chapters = [];
+      v.querySelectorAll("li.col-4").forEach((li) => {
+        const a = li.querySelector("a");
+        if (!a) return;
+        const href = a.getAttribute("href") || "";
+        if (href.includes("javascript") || !href.trim()) return;
+        chapters.push({ title: textOf(li) || textOf(a), url: absUrl(href, base) });
+      });
+      volumes.push({ index: i + 1, title, chapters });
+    });
+    return volumes;
+  }
+
+  async function fetchBookNovel(bookNo, base) {
+    const html = await fetchText(`${base}/novel/${bookNo}.html`);
+    const doc = parseDoc(html);
+    const meta = (p) => {
+      const m = doc.querySelector(`meta[property="${p}"]`);
+      return m && m.getAttribute("content") ? m.getAttribute("content").trim() : "";
+    };
+    const title = meta("og:novel:book_name") || textOf(doc.querySelector("h1"));
+    const author = meta("og:novel:author") || "未知作者";
+    let publisher = "", tags = [];
+    const label = doc.querySelector("div.book-label");
+    if (label) {
+      publisher = textOf(label.querySelector("a.label"));
+      const span = label.querySelector("span");
+      if (span) tags = Array.from(span.querySelectorAll("a")).map((a) => textOf(a)).filter(Boolean);
+    }
+    let summary = "";
+    const dec = doc.querySelector("div.book-dec") || doc.querySelector(".book-dec");
+    if (dec) { const p = dec.querySelector("p"); summary = p ? textOf(p) : textOf(dec); }
+    let coverUrl = "";
+    const bi = doc.querySelector("div.book-img img") || doc.querySelector(".book-img img");
+    if (bi) coverUrl = bi.getAttribute("src") || "";
+    const volumes = await fetchCatalogNovel(bookNo, base);
+    return { bookNo, base, kind: "novel", title: title || `未知(${bookNo})`,
+             author, publisher, summary, coverUrl, tags, volumes };
+  }
+
+  function pad2(n) { return String(n).padStart(2, "0"); }
+
+  function textXhtmlNovel(title, body) {
+    return '<?xml version="1.0" encoding="utf-8"?>\n' +
+      '<html xmlns="http://www.w3.org/1999/xhtml"><head>\n' +
+      `<title>${escXml(title)}</title>\n` +
+      "<style>body{line-height:1.75;} p{text-indent:2em;margin:.6em 0;} " +
+      "img{display:block;margin:1em auto;max-width:100%;height:auto;}</style>\n" +
+      `</head><body>\n<h1>${escXml(title)}</h1>\n${body}\n</body></html>`;
+  }
+
+  function coverXhtmlNovel(w, h) {
+    return '<?xml version="1.0" encoding="UTF-8"?>\n' +
+      '<html xmlns="http://www.w3.org/1999/xhtml"><head><title>Cover</title></head>\n' +
+      '<body style="margin:0;padding:0;text-align:center;">\n' +
+      `<svg xmlns="http://www.w3.org/2000/svg" height="100%" preserveAspectRatio="xMidYMid meet" version="1.1" viewBox="0 0 ${w} ${h}" width="100%" xmlns:xlink="http://www.w3.org/1999/xlink">\n` +
+      `<image width="${w}" height="${h}" xlink:href="../Images/00.jpg"/></svg>\n</body></html>`;
+  }
+
+  function buildEpubNovel(book, vol, chapters, images) {
+    const entries = [];
+    entries.push({ name: "mimetype", data: enc("application/epub+zip") });
+    entries.push({ name: "META-INF/container.xml", data: enc(
+      '<?xml version="1.0" encoding="UTF-8"?>\n' +
+      '<container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container">\n' +
+      '  <rootfiles>\n    <rootfile full-path="OEBPS/content.opf" media-type="application/oebps-package+xml"/>\n  </rootfiles>\n</container>') });
+
+    const textItems = [], spineItems = [], navPoints = [];
+    let chapNo = 0;
+    for (const c of chapters) {
+      if (!c.body.trim()) continue;
+      const fn = pad2(chapNo) + ".xhtml";
+      entries.push({ name: `OEBPS/Text/${fn}`, data: enc(textXhtmlNovel(c.title, c.body)) });
+      textItems.push(`    <item id="x${pad2(chapNo)}" href="Text/${fn}" media-type="application/xhtml+xml"/>`);
+      spineItems.push(`    <itemref idref="x${pad2(chapNo)}"/>`);
+      navPoints.push({ name: c.title, fn });
+      chapNo += 1;
+    }
+    const imgItems = [];
+    for (const idx of Object.keys(images).sort()) {
+      entries.push({ name: `OEBPS/Images/${idx}.jpg`, data: images[idx].jpeg });
+      imgItems.push(`    <item id="img${idx}" href="Images/${idx}.jpg" media-type="image/jpeg"/>`);
+    }
+    let coverItem = "", coverSpine = "";
+    if (images["00"]) {
+      const w = images["00"].width || 600, h = images["00"].height || 800;
+      entries.push({ name: "OEBPS/Text/cover.xhtml", data: enc(coverXhtmlNovel(w, h)) });
+      coverItem = '    <item id="cover" href="Text/cover.xhtml" media-type="application/xhtml+xml"/>\n' +
+        '    <item id="cover-img" href="Images/00.jpg" media-type="image/jpeg" properties="cover-image"/>';
+      coverSpine = '    <itemref idref="cover"/>';
+    }
+    const subjects = (book.tags || []).map((t) => `    <dc:subject>${escXml(t)}</dc:subject>`).join("\n");
+    const ncxPoints = navPoints.map((p, i) =>
+      `    <navPoint id="n${i}" playOrder="${i + 1}"><navLabel><text>${escXml(p.name)}</text></navLabel><content src="Text/${p.fn}"/></navPoint>`).join("\n");
+    const toc = '<?xml version="1.0" encoding="utf-8"?>\n' +
+      '<ncx xmlns="http://www.daisy.org/z3986/2005/ncx/" version="2005-1"><head>\n' +
+      `<meta name="dtb:uid" content="linovelib-${book.bookNo}-${vol.index}"/></head>\n` +
+      `<docTitle><text>${escXml(book.title)}-${escXml(vol.title)}</text></docTitle>\n` +
+      `<navMap>\n${ncxPoints}\n</navMap></ncx>`;
+    const opf = '<?xml version="1.0" encoding="utf-8"?>\n' +
+      '<package version="3.0" unique-identifier="BookId" xmlns="http://www.idpf.org/2007/opf">\n' +
+      '  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/">\n' +
+      `    <dc:identifier id="BookId">linovelib-${book.bookNo}-${vol.index}</dc:identifier>\n` +
+      `    <dc:title>${escXml(book.title)}-${escXml(vol.title)}</dc:title>\n` +
+      "    <dc:language>zh-CN</dc:language>\n" +
+      `    <dc:creator>${escXml(book.author)}</dc:creator>\n` +
+      `    <dc:publisher>${escXml(book.publisher || "")}</dc:publisher>\n` +
+      `    <dc:description>${escXml(book.summary || "")}</dc:description>\n` +
+      (subjects ? subjects + "\n" : "") +
+      `    <meta name="calibre:series" content="${escXml(book.title)}"/>\n` +
+      `    <meta name="calibre:series_index" content="${vol.index}"/>\n` +
+      "  </metadata>\n  <manifest>\n" +
+      '    <item id="ncx" href="toc.ncx" media-type="application/x-dtbncx+xml"/>\n' +
+      (coverItem ? coverItem + "\n" : "") +
+      textItems.join("\n") + "\n" + imgItems.join("\n") +
+      "\n  </manifest>\n  <spine toc=\"ncx\">\n" +
+      (coverSpine ? coverSpine + "\n" : "") +
+      spineItems.join("\n") + "\n  </spine>\n</package>";
+    entries.push({ name: "OEBPS/toc.ncx", data: enc(toc) });
+    entries.push({ name: "OEBPS/content.opf", data: enc(opf) });
+    return buildZip(entries);
+  }
+
+  async function processVolumeNovel(book, vol, prog) {
+    prog.setState("下载正文…");
+    const jobs = vol.chapters.map((c, i) => ({ c, i })).filter((j) => !j.c.url.includes("javascript"));
+    const bodies = new Array(vol.chapters.length).fill("");
+    let done = 0;
+    await runPool(jobs, 3, async ({ c, i }) => {
+      try { bodies[i] = await fetchChapterTextNovel(c.url, book.base); }
+      catch (e) { bodies[i] = ""; }
+      done += 1;
+      prog.setRatio(done / (jobs.length * 1.3));
+      prog.setState(`下载正文 ${done}/${jobs.length}`);
+    });
+
+    // 按章节顺序统一给插图编号（第一张 00 作封面）
+    const ordered = jobs.map((j) => bodies[j.i] || "");
+    const imgMap = {};
+    for (const b of ordered) {
+      const re = /<img class="__nv__" src="([^"]+)"\/>/g;
+      let m;
+      while ((m = re.exec(b))) if (!(m[1] in imgMap)) imgMap[m[1]] = pad2(Object.keys(imgMap).length);
+    }
+    const rewrite = (b) => b.replace(/<img class="__nv__" src="([^"]+)"\/>/g, (mm, u) => {
+      const idx = imgMap[u];
+      return idx === "00" ? "" : `<img alt="${idx}" src="../Images/${idx}.jpg"/>`;
+    });
+    const chapters = jobs.map((j, k) => ({ title: j.c.title, body: rewrite(ordered[k]) }));
+    const imgUrls = Object.keys(imgMap);
+    if (!chapters.some((c) => c.body.trim()) && imgUrls.length <= 1) {
+      prog.error("未获取到正文（可能被临时限流，稍后重试）");
+      return;
+    }
+
+    prog.setState(`下载插图 ${imgUrls.length} 张…`);
+    const images = {};
+    await runPool(imgUrls, IMAGE_CONCURRENCY, async (u) => {
+      try { images[imgMap[u]] = await fetchImageAsJpeg(u); } catch (e) {}
+    });
+
+    prog.setState("打包中…");
+    const bytes = buildEpubNovel(book, vol, chapters, images);
+    saveFile(bytes, safeName(`${book.title} - ${vol.title}`) + ".epub", "epub");
+    prog.done();
   }
 
   function imageUrlsFromDoc(doc, base) {
@@ -883,6 +1126,7 @@
   let panel = null;
   let currentBook = null;
   let bookNo = "";
+  let siteKind = "manga";   // manga | novel
 
   function buildPanel() {
     panel = document.createElement("div");
@@ -938,8 +1182,10 @@
   }
 
   function renderBook(book) {
+    const unit = book.kind === "novel" ? "卷" : "章";
+    const cunit = book.kind === "novel" ? "章" : "话";
     panel.querySelector("#bmd-meta").innerHTML =
-      `<b>${escHtml(book.title)}</b><br>作者：${escHtml(book.author)}　共 ${book.volumes.length} 章`;
+      `<b>${escHtml(book.title)}</b><br>作者：${escHtml(book.author)}　共 ${book.volumes.length} ${unit}`;
     const list = panel.querySelector("#bmd-list");
     list.innerHTML = "";
     book.volumes.forEach((vol) => {
@@ -947,7 +1193,7 @@
       label.innerHTML =
         `<input type="checkbox" data-index="${vol.index}" checked> ` +
         `<span class="idx">${vol.index}.</span>${escHtml(vol.title)} ` +
-        `<span class="cnt">（${vol.chapters.length} 话）</span>`;
+        `<span class="cnt">（${vol.chapters.length} ${cunit}）</span>`;
       list.appendChild(label);
     });
   }
@@ -957,10 +1203,12 @@
     currentBook = null;
     panel.querySelector("#bmd-meta").textContent = "正在读取本书目录…";
     try {
-      const book = await fetchBook(bookNo, location.origin);
+      const book = siteKind === "novel"
+        ? await fetchBookNovel(bookNo, location.origin)
+        : await fetchBook(bookNo, location.origin);
       currentBook = book;
       renderBook(book);
-      if (book.volumes.length === 0) setHint("未解析到任何章节，请确认页面是否正确。");
+      if (book.volumes.length === 0) setHint("未解析到任何卷/章，请确认页面是否正确。");
     } catch (e) {
       panel.querySelector("#bmd-meta").textContent = "";
       setHint("读取失败：" + e.message);
@@ -1014,7 +1262,8 @@
       for (const vol of volumes) {
         const prog = createProgress(`${vol.index}. ${vol.title}`);
         try {
-          await processVolume(book, vol, fmt, prog);
+          if (book.kind === "novel") await processVolumeNovel(book, vol, prog);
+          else await processVolume(book, vol, fmt, prog);
         } catch (e) {
           prog.error("失败：" + e.message);
           if (String(e.message).includes("Cloudflare")) {
@@ -1035,15 +1284,18 @@
     if (visible && !currentBook) loadCurrentBook(); // 首次展开：直接加载当前这本书
   }
 
-  // 仅在漫画详情页 / 目录页 / 阅读页注入按钮：从当前 URL 提取书号。
+  // 从当前 URL 提取书号，并判断是漫画还是轻小说。
   function detectBookNo() {
+    const nv = /\/novel\/(\d+)/.exec(location.pathname);
+    if (nv) { siteKind = "novel"; return nv[1]; }
     const m = /\/(?:detail|read)\/(\d+)/.exec(location.pathname);
-    return m ? m[1] : "";
+    if (m) { siteKind = "manga"; return m[1]; }
+    return "";
   }
 
   function init() {
     bookNo = detectBookNo();
-    if (!bookNo) return; // 非漫画页面不显示按钮
+    if (!bookNo) return; // 非漫画/轻小说页面不显示按钮
     const fab = document.createElement("button");
     fab.id = "bmd-fab";
     fab.textContent = "⬇ 下载本书";
