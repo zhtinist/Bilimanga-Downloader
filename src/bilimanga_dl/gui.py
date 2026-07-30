@@ -1,12 +1,18 @@
-"""原生图形界面（Tkinter）。
+"""原生图形界面（Tkinter，深色主题）。
 
-不起本地服务、不开浏览器 —— 直接是一个独立窗口，双击可执行文件即用。
-这样可避开：①浏览器二次打开卡死；②macOS 对监听端口的可执行文件反复弹
-“允许接受传入网络连接”的风险提示。下载逻辑仍复用命令行版的
-:class:`Net` / :class:`Scraper` / :class:`Downloader`。
+不起本地服务、不开浏览器 —— 一个独立窗口，双击可执行文件即用，避开：
+①浏览器二次打开卡死；②macOS 对监听端口的可执行文件反复弹网络提示。
+下载逻辑复用命令行版的 :class:`Net` / :class:`Scraper` / :class:`Downloader`。
 
-Tkinter 非线程安全：抓取/下载都在后台线程跑，只通过线程安全队列把进度回传，
-主线程用 ``after`` 轮询队列刷新界面。
+界面分三屏（同窗切换）：
+- 主屏：输入链接/书号 → 解析 → 直接在同屏选章 → 开始下载（②③合一）。
+- 设置屏：点右上角「⚙ 设置」进入，「← 返回」回主屏。
+- 进度屏：点「开始下载」跳转，逐卷进度；完成后「← 返回」再下一本。
+
+深色主题：结构（Frame/Label/Entry/Checkbutton/Radiobutton）用经典 tk 控件并显式
+配色 —— macOS 的原生 ttk 会忽略这些背景色，而 tk 控件能可靠上色；按钮/表格/滚动条
+用 ttk + clam 主题上色。Tkinter 非线程安全：抓取/下载在后台线程跑，只用线程安全
+队列回传，主线程 ``after`` 轮询刷新；布局 grid + 权重，窗口再矮也不裁切按钮。
 """
 
 from __future__ import annotations
@@ -30,13 +36,31 @@ from .scraper import Scraper, parse_book_no
 
 log = get_logger("gui")
 
+# ---- 深色配色 ----
+BG = "#15151b"
+CARD = "#1f1f29"
+CARD2 = "#2a2a37"
+FG = "#e9e9f0"
+MUTED = "#9a9aa8"
+ACCENT = "#5b8cff"
+ACCENT_ACT = "#4a77e6"
+BORDER = "#33333f"
+OK = "#3ecb7f"
+ERR = "#ff6b6b"
+WARN = "#f2b750"
+
+FONT = ("Helvetica", 13)
+FONT_SM = ("Helvetica", 12)
+FONT_TITLE = ("Helvetica", 17, "bold")
+FONT_BOOK = ("Helvetica", 15, "bold")
+
 PHASE_LABEL = {
-    "wait": "等待",
-    "download": "下载中",
-    "validate": "校对",
-    "package": "打包",
-    "done": "完成",
-    "empty": "无内容",
+    "wait": "等待", "download": "下载中", "validate": "校对",
+    "package": "打包", "done": "完成", "empty": "无内容",
+}
+PHASE_COLOR = {
+    "wait": MUTED, "download": ACCENT, "validate": WARN,
+    "package": WARN, "done": OK, "empty": ERR,
 }
 
 
@@ -47,12 +71,16 @@ class DownloaderGUI:
         self.net: Optional[Net] = None
         self.scraper: Optional[Scraper] = None
         self.book: Optional[Book] = None
-        self.vol_vars: dict = {}       # vidx -> BooleanVar（选章）
-        self.prog_rows: dict = {}      # vidx -> treeview item id（进度）
+        self.vol_vars: dict = {}
+        self.prog_rows: dict = {}
+        self._prog_state: dict = {}
         self.msgq: "queue.Queue" = queue.Queue()
         self.busy = False
+        self.view = "home"
 
+        self._init_style()
         self._build()
+        self._show("home")
         self.root.after(120, self._drain)
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
@@ -71,110 +99,231 @@ class DownloaderGUI:
         self.net = None
         self.scraper = None
 
-    # ---------------- 界面搭建 ----------------
-    def _build(self):
-        self.root.title("bilimanga 漫画下载器")
-        self.root.geometry("760x680")
-        self.root.minsize(680, 560)
+    # ---------------- 小控件工厂（经典 tk，可靠上色）----------------
+    def _frame(self, parent, bg=BG, **kw):
+        return tk.Frame(parent, bg=bg, **kw)
 
-        style = ttk.Style()
+    def _label(self, parent, text="", textvariable=None, bg=BG, fg=FG, font=FONT, **kw):
+        return tk.Label(parent, text=text, textvariable=textvariable, bg=bg, fg=fg,
+                        font=font, **kw)
+
+    def _entry(self, parent, textvariable, **kw):
+        return tk.Entry(parent, textvariable=textvariable, bg=CARD, fg=FG, font=FONT,
+                        insertbackground=FG, relief="flat", highlightthickness=1,
+                        highlightbackground=BORDER, highlightcolor=ACCENT, **kw)
+
+    def _check(self, parent, text, var):
+        return tk.Checkbutton(parent, text=text, variable=var, bg=CARD, fg=FG,
+                              selectcolor=CARD2, activebackground=CARD, activeforeground=FG,
+                              anchor="w", font=FONT_SM, highlightthickness=0, bd=0,
+                              padx=8, pady=2)
+
+    def _radio(self, parent, text, value, var, bg=BG):
+        return tk.Radiobutton(parent, text=text, value=value, variable=var, bg=bg, fg=FG,
+                              selectcolor=CARD2, activebackground=bg, activeforeground=FG,
+                              font=FONT_SM, highlightthickness=0, bd=0)
+
+    # ---------------- ttk 主题（按钮/表格/滚动条）----------------
+    def _init_style(self):
+        self.root.configure(bg=BG)
+        st = ttk.Style()
         try:
-            style.theme_use("clam")
+            st.theme_use("clam")
         except tk.TclError:
             pass
+        st.configure("TButton", background=CARD2, foreground=FG, borderwidth=0,
+                     focusthickness=0, padding=(14, 8), font=FONT_SM)
+        st.map("TButton", background=[("active", BORDER), ("pressed", BORDER)])
+        st.configure("Accent.TButton", background=ACCENT, foreground="#ffffff",
+                     font=("Helvetica", 13, "bold"), padding=(18, 9), borderwidth=0)
+        st.map("Accent.TButton",
+               background=[("active", ACCENT_ACT), ("pressed", ACCENT_ACT), ("disabled", BORDER)],
+               foreground=[("disabled", MUTED)])
+        st.configure("Ghost.TButton", background=BG, foreground=MUTED, padding=(10, 6),
+                     borderwidth=0)
+        st.map("Ghost.TButton", background=[("active", CARD)], foreground=[("active", FG)])
 
-        pad = {"padx": 10, "pady": 6}
-        main = ttk.Frame(self.root, padding=12)
-        main.pack(fill="both", expand=True)
+        st.configure("Treeview", background=CARD, fieldbackground=CARD, foreground=FG,
+                     borderwidth=0, rowheight=30, font=FONT_SM)
+        st.configure("Treeview.Heading", background=CARD2, foreground=MUTED, borderwidth=0,
+                     font=("Helvetica", 11))
+        st.map("Treeview", background=[("selected", CARD2)], foreground=[("selected", FG)])
+        st.configure("Vertical.TScrollbar", background=CARD2, troughcolor=BG,
+                     bordercolor=BG, arrowcolor=MUTED, borderwidth=0)
+        st.map("Vertical.TScrollbar", background=[("active", BORDER)])
 
-        # ① 设置
-        setg = ttk.LabelFrame(main, text="① 设置", padding=10)
-        setg.pack(fill="x")
-        setg.columnconfigure(1, weight=1)
+    # ---------------- 布局 ----------------
+    def _build(self):
+        self.root.title("bilimanga 漫画下载器")
+        self.root.geometry("720x640")
+        self.root.minsize(600, 460)
 
-        ttk.Label(setg, text="站点地址").grid(row=0, column=0, sticky="w", **pad)
-        self.var_site = tk.StringVar(value=self.config.site_url or DEFAULT_SITE)
-        ttk.Entry(setg, textvariable=self.var_site).grid(row=0, column=1, columnspan=2, sticky="ew", **pad)
+        top = self._frame(self.root)
+        top.pack(fill="x", padx=16, pady=(14, 6))
+        self._label(top, "bilimanga 漫画下载器", font=FONT_TITLE).pack(side="left")
+        self.nav_btn = ttk.Button(top, text="⚙ 设置", style="Ghost.TButton",
+                                  command=self._nav_click)
+        self.nav_btn.pack(side="right")
 
-        ttk.Label(setg, text="下载目录").grid(row=1, column=0, sticky="w", **pad)
-        self.var_out = tk.StringVar(value=self.config.output_dir or "")
-        ttk.Entry(setg, textvariable=self.var_out).grid(row=1, column=1, sticky="ew", **pad)
-        ttk.Button(setg, text="浏览…", command=self._browse_out).grid(row=1, column=2, sticky="e", **pad)
+        self.container = self._frame(self.root)
+        self.container.pack(fill="both", expand=True, padx=16, pady=(6, 14))
+        self.container.rowconfigure(0, weight=1)
+        self.container.columnconfigure(0, weight=1)
 
-        ttk.Label(setg, text="格式").grid(row=2, column=0, sticky="w", **pad)
-        rowf = ttk.Frame(setg)
-        rowf.grid(row=2, column=1, columnspan=2, sticky="w", **pad)
+        self.home = self._frame(self.container)
+        self.settings = self._frame(self.container)
+        self.progress = self._frame(self.container)
+        for f in (self.home, self.settings, self.progress):
+            f.grid(row=0, column=0, sticky="nsew")
+
+        self._build_home()
+        self._build_settings()
+        self._build_progress()
+
+    def _build_home(self):
+        f = self.home
+        f.columnconfigure(0, weight=1)
+        f.rowconfigure(3, weight=1)
+
+        row = self._frame(f)
+        row.grid(row=0, column=0, sticky="ew")
+        row.columnconfigure(0, weight=1)
+        self.var_input = tk.StringVar()
+        ent = self._entry(row, self.var_input)
+        ent.grid(row=0, column=0, sticky="ew", ipady=5)
+        ent.bind("<Return>", lambda e: self._on_parse())
+        self.btn_parse = ttk.Button(row, text="解析", style="Accent.TButton", command=self._on_parse)
+        self.btn_parse.grid(row=0, column=1, padx=(10, 0))
+        self._label(f, "粘贴详情页 / 目录页链接或书号，例如 54", fg=MUTED, font=FONT_SM).grid(
+            row=1, column=0, sticky="w", pady=(6, 12))
+
+        head = self._frame(f)
+        head.grid(row=2, column=0, sticky="ew")
+        head.columnconfigure(0, weight=1)
+        self.var_book = tk.StringVar(value="")
+        self._label(head, textvariable=self.var_book, font=FONT_BOOK, anchor="w",
+                    justify="left", wraplength=520).grid(row=0, column=0, sticky="w")
+        selbar = self._frame(head)
+        selbar.grid(row=0, column=1, sticky="e")
+        ttk.Button(selbar, text="全选", style="Ghost.TButton",
+                   command=lambda: self._set_all(True)).pack(side="left")
+        ttk.Button(selbar, text="全不选", style="Ghost.TButton",
+                   command=lambda: self._set_all(False)).pack(side="left")
+
+        card = self._frame(f, bg=CARD, highlightthickness=1, highlightbackground=BORDER)
+        card.grid(row=3, column=0, sticky="nsew", pady=(8, 12))
+        self.vol_canvas = tk.Canvas(card, bg=CARD, highlightthickness=0)
+        vsb = ttk.Scrollbar(card, orient="vertical", command=self.vol_canvas.yview)
+        self.vol_inner = tk.Frame(self.vol_canvas, bg=CARD)
+        self.vol_inner.bind("<Configure>",
+                            lambda e: self.vol_canvas.configure(scrollregion=self.vol_canvas.bbox("all")))
+        self._vol_win = self.vol_canvas.create_window((0, 0), window=self.vol_inner, anchor="nw")
+        self.vol_canvas.bind("<Configure>",
+                             lambda e: self.vol_canvas.itemconfigure(self._vol_win, width=e.width))
+        self.vol_canvas.configure(yscrollcommand=vsb.set)
+        self.vol_canvas.pack(side="left", fill="both", expand=True)
+        vsb.pack(side="right", fill="y")
+        self.vol_canvas.bind_all("<MouseWheel>", self._on_wheel)
+        self.var_empty = tk.StringVar(value="解析后在此选择要下载的章。")
+        self.lbl_empty = self._label(self.vol_inner, textvariable=self.var_empty, bg=CARD,
+                                     fg=MUTED, font=FONT_SM, anchor="w", justify="left")
+        self.lbl_empty.pack(fill="x", padx=12, pady=12)
+
+        bottom = self._frame(f)
+        bottom.grid(row=4, column=0, sticky="ew")
+        bottom.columnconfigure(2, weight=1)
         self.var_fmt = tk.StringVar(value=self.config.default_format or "epub")
-        ttk.Radiobutton(rowf, text="EPUB", value="epub", variable=self.var_fmt).pack(side="left")
-        ttk.Radiobutton(rowf, text="PDF", value="pdf", variable=self.var_fmt).pack(side="left", padx=(12, 0))
-        ttk.Label(rowf, text="  并发").pack(side="left", padx=(20, 4))
-        self.var_par = tk.StringVar(value=str(self.config.parallel_chapters))
-        ttk.Entry(rowf, textvariable=self.var_par, width=5).pack(side="left")
+        self._radio(bottom, "EPUB", "epub", self.var_fmt).grid(row=0, column=0)
+        self._radio(bottom, "PDF", "pdf", self.var_fmt).grid(row=0, column=1, padx=(14, 0))
+        self.btn_start = ttk.Button(bottom, text="开始下载", style="Accent.TButton",
+                                    command=self._on_download, state="disabled")
+        self.btn_start.grid(row=0, column=3, sticky="e")
 
-        ttk.Label(setg, text="代理").grid(row=3, column=0, sticky="w", **pad)
+    def _build_settings(self):
+        f = self.settings
+        f.columnconfigure(1, weight=1)
+        pad = {"padx": 8, "pady": 8}
+        self._label(f, "设置", font=FONT_TITLE).grid(row=0, column=0, columnspan=3,
+                                                    sticky="w", pady=(0, 10))
+
+        self._label(f, "站点地址").grid(row=1, column=0, sticky="w", **pad)
+        self.var_site = tk.StringVar(value=self.config.site_url or DEFAULT_SITE)
+        self._entry(f, self.var_site).grid(row=1, column=1, columnspan=2, sticky="ew", ipady=4, **pad)
+
+        self._label(f, "下载目录").grid(row=2, column=0, sticky="w", **pad)
+        self.var_out = tk.StringVar(value=self.config.output_dir or "")
+        self._entry(f, self.var_out).grid(row=2, column=1, sticky="ew", ipady=4, **pad)
+        ttk.Button(f, text="浏览…", command=self._browse_out).grid(row=2, column=2, **pad)
+
+        self._label(f, "并发数").grid(row=3, column=0, sticky="w", **pad)
+        self.var_par = tk.StringVar(value=str(self.config.parallel_chapters))
+        self._entry(f, self.var_par, width=8).grid(row=3, column=1, sticky="w", ipady=4, **pad)
+
+        self._label(f, "代理").grid(row=4, column=0, sticky="w", **pad)
         self.var_proxy = tk.StringVar(value=self.config.proxy or "")
-        ttk.Entry(setg, textvariable=self.var_proxy).grid(row=3, column=1, sticky="ew", **pad)
-        ttk.Button(setg, text="保存设置", command=self._save_cfg).grid(row=3, column=2, sticky="e", **pad)
+        self._entry(f, self.var_proxy).grid(row=4, column=1, columnspan=2, sticky="ew", ipady=4, **pad)
 
         self.var_hint = tk.StringVar()
-        ttk.Label(setg, textvariable=self.var_hint, foreground="#666").grid(
-            row=4, column=0, columnspan=3, sticky="w", padx=10)
+        self._label(f, textvariable=self.var_hint, fg=MUTED, font=FONT_SM).grid(
+            row=5, column=0, columnspan=3, sticky="w", padx=8, pady=(2, 12))
         self._refresh_hint()
 
-        # ② 输入 + 解析
-        inp = ttk.LabelFrame(main, text="② 输入漫画（详情页 / 目录页链接 / 书号）", padding=10)
-        inp.pack(fill="x", pady=(10, 0))
-        inp.columnconfigure(0, weight=1)
-        self.var_input = tk.StringVar()
-        ent = ttk.Entry(inp, textvariable=self.var_input)
-        ent.grid(row=0, column=0, sticky="ew", padx=(0, 8))
-        ent.bind("<Return>", lambda e: self._on_parse())
-        self.btn_parse = ttk.Button(inp, text="解析", command=self._on_parse)
-        self.btn_parse.grid(row=0, column=1)
+        ttk.Button(f, text="保存设置", style="Accent.TButton", command=self._save_cfg).grid(
+            row=6, column=0, columnspan=3, sticky="e", pady=(6, 0), padx=8)
 
-        # ③ 选章
-        self.book_frame = ttk.LabelFrame(main, text="③ 选择要下载的章", padding=10)
-        self.book_frame.pack(fill="both", expand=True, pady=(10, 0))
-        self.var_book = tk.StringVar(value="解析后在此显示书目与章节。")
-        ttk.Label(self.book_frame, textvariable=self.var_book, wraplength=700, justify="left").pack(
-            anchor="w")
-
-        selbar = ttk.Frame(self.book_frame)
-        selbar.pack(fill="x", pady=(6, 4))
-        ttk.Button(selbar, text="全选", command=lambda: self._set_all(True)).pack(side="left")
-        ttk.Button(selbar, text="全不选", command=lambda: self._set_all(False)).pack(side="left", padx=(8, 0))
-        self.btn_start = ttk.Button(selbar, text="开始下载", command=self._on_download, state="disabled")
-        self.btn_start.pack(side="right")
-
-        # 可滚动的章节勾选区
-        canvas = tk.Canvas(self.book_frame, height=150, highlightthickness=0)
-        vsb = ttk.Scrollbar(self.book_frame, orient="vertical", command=canvas.yview)
-        self.vol_inner = ttk.Frame(canvas)
-        self.vol_inner.bind(
-            "<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
-        canvas.create_window((0, 0), window=self.vol_inner, anchor="nw")
-        canvas.configure(yscrollcommand=vsb.set)
-        canvas.pack(side="left", fill="both", expand=True)
-        vsb.pack(side="right", fill="y")
-
-        # ④ 进度
-        prog = ttk.LabelFrame(main, text="④ 下载进度", padding=10)
-        prog.pack(fill="both", expand=True, pady=(10, 0))
-        self.tree = ttk.Treeview(prog, columns=("state", "prog"), show="tree headings", height=6)
+    def _build_progress(self):
+        f = self.progress
+        f.columnconfigure(0, weight=1)
+        f.rowconfigure(1, weight=1)
+        self._label(f, "下载进度", font=FONT_TITLE).grid(row=0, column=0, sticky="w", pady=(0, 10))
+        wrap = self._frame(f, bg=CARD, highlightthickness=1, highlightbackground=BORDER)
+        wrap.grid(row=1, column=0, sticky="nsew")
+        self.tree = ttk.Treeview(wrap, columns=("state", "prog"), show="tree headings")
         self.tree.heading("#0", text="卷")
         self.tree.heading("state", text="状态")
         self.tree.heading("prog", text="进度")
-        self.tree.column("#0", width=380)
+        self.tree.column("#0", width=360, anchor="w")
         self.tree.column("state", width=90, anchor="center")
-        self.tree.column("prog", width=120, anchor="center")
-        self.tree.pack(fill="both", expand=True)
-        self.var_status = tk.StringVar(value="就绪。")
-        ttk.Label(main, textvariable=self.var_status, foreground="#333").pack(anchor="w", pady=(8, 0))
+        self.tree.column("prog", width=160, anchor="center")
+        tvsb = ttk.Scrollbar(wrap, orient="vertical", command=self.tree.yview)
+        self.tree.configure(yscrollcommand=tvsb.set)
+        self.tree.pack(side="left", fill="both", expand=True)
+        tvsb.pack(side="right", fill="y")
+        for ph, col in PHASE_COLOR.items():
+            self.tree.tag_configure(ph, foreground=col)
 
-    # ---------------- 设置相关 ----------------
+        row = self._frame(f)
+        row.grid(row=2, column=0, sticky="ew", pady=(10, 0))
+        row.columnconfigure(0, weight=1)
+        self.var_status = tk.StringVar(value="")
+        self._label(row, textvariable=self.var_status, fg=MUTED, font=FONT_SM).grid(
+            row=0, column=0, sticky="w")
+        self.btn_reveal = ttk.Button(row, text="打开输出目录", style="Ghost.TButton",
+                                     command=self._reveal, state="disabled")
+        self.btn_reveal.grid(row=0, column=1, sticky="e")
+
+    # ---------------- 视图切换 ----------------
+    def _show(self, name: str):
+        self.view = name
+        {"home": self.home, "settings": self.settings, "progress": self.progress}[name].tkraise()
+        if name == "home":
+            self.nav_btn.configure(text="⚙ 设置", state="normal")
+        elif name == "settings":
+            self.nav_btn.configure(text="← 返回", state="normal")
+        else:
+            self.nav_btn.configure(text="← 返回", state=("disabled" if self.busy else "normal"))
+
+    def _nav_click(self):
+        self._show("settings" if self.view == "home" else "home")
+
+    def _on_wheel(self, event):
+        if self.view == "home":
+            self.vol_canvas.yview_scroll(int(-1 * (event.delta / 40)), "units")
+
+    # ---------------- 设置 ----------------
     def _refresh_hint(self):
         eff = (self.var_out.get().strip() or str(default_download_dir()))
-        self.var_hint.set(f"文件将保存到：{Path(eff).expanduser()}（留空=浏览器下载目录）")
+        self.var_hint.set(f"文件将保存到：{Path(eff).expanduser()}（留空 = 浏览器下载目录）")
 
     def _browse_out(self):
         init = self.var_out.get().strip() or str(default_download_dir())
@@ -183,7 +332,7 @@ class DownloaderGUI:
             self.var_out.set(d)
             self._refresh_hint()
 
-    def _save_cfg(self):
+    def _apply_cfg(self) -> bool:
         c = self.config
         site = self.var_site.get().strip()
         if site and not site.startswith("http"):
@@ -195,7 +344,7 @@ class DownloaderGUI:
                 Path(out).expanduser().mkdir(parents=True, exist_ok=True)
             except OSError as exc:
                 messagebox.showerror("目录无效", f"无法创建该目录：{exc}")
-                return
+                return False
         c.output_dir = out
         if self.var_fmt.get() in ("epub", "pdf"):
             c.default_format = self.var_fmt.get()
@@ -203,9 +352,13 @@ class DownloaderGUI:
         if par.isdigit() and int(par) > 0:
             c.parallel_chapters = int(par)
         c.proxy = self.var_proxy.get().strip()
-        c.save()
-        self._refresh_hint()
-        self.var_status.set("设置已保存。")
+        return True
+
+    def _save_cfg(self):
+        if self._apply_cfg():
+            self.config.save()
+            self._refresh_hint()
+            self._show("home")
 
     # ---------------- 解析 ----------------
     def _on_parse(self):
@@ -215,11 +368,11 @@ class DownloaderGUI:
         if not text:
             messagebox.showinfo("提示", "请输入详情页链接、目录页链接或书号。")
             return
-        self._save_cfg()  # 解析前先应用站点/代理等设置
+        self._apply_cfg()
         self.busy = True
         self.btn_parse.configure(state="disabled", text="解析中…")
         self.btn_start.configure(state="disabled")
-        self.var_status.set("正在解析……（首次需启动浏览器过 Cloudflare，约 10–20 秒）")
+        self.var_empty.set("正在解析……首次需启动浏览器过 Cloudflare（约 10–20 秒）。")
         threading.Thread(target=self._parse_worker, args=(text,), daemon=True).start()
 
     def _parse_worker(self, text: str):
@@ -236,16 +389,15 @@ class DownloaderGUI:
 
     def _render_book(self, book: Book):
         self.book = book
-        self.var_book.set(f"《{book.title}》　{book.author}　共 {len(book.volumes)} 章")
+        self.var_book.set(f"《{book.title}》  {book.author} · 共 {len(book.volumes)} 章")
         for w in self.vol_inner.winfo_children():
             w.destroy()
         self.vol_vars = {}
         for v in book.volumes:
             var = tk.BooleanVar(value=True)
             self.vol_vars[v.index] = var
-            ttk.Checkbutton(
-                self.vol_inner, variable=var,
-                text=f"{v.index}. {v.title}　（{len(v.chapters)} 话）").pack(anchor="w")
+            self._check(self.vol_inner, f"{v.index}.  {v.title}   （{len(v.chapters)} 话）",
+                        var).pack(anchor="w", fill="x", pady=1)
         self.btn_start.configure(state="normal")
 
     def _set_all(self, val: bool):
@@ -260,24 +412,24 @@ class DownloaderGUI:
         if not selected:
             messagebox.showinfo("提示", "请至少选择一章。")
             return
-        self._save_cfg()
-        out_root = self.config.output_path()  # 未配置则默认浏览器下载目录
+        self._apply_cfg()
+        out_root = self.config.output_path()
         index_map = {v.index: v for v in self.book.volumes}
         vols = [index_map[i] for i in selected]
 
-        # 重置进度表
         for iid in self.tree.get_children():
             self.tree.delete(iid)
         self.prog_rows = {}
+        self._prog_state = {}
         for v in vols:
             iid = self.tree.insert("", "end", text=f"{v.index}. {v.title}",
-                                   values=("等待", ""))
+                                   values=("等待", ""), tags=("wait",))
             self.prog_rows[v.index] = iid
 
         self.busy = True
-        self.btn_start.configure(state="disabled")
-        self.btn_parse.configure(state="disabled")
-        self.var_status.set(f"开始下载，输出到：{out_root}")
+        self.btn_reveal.configure(state="disabled")
+        self.var_status.set(f"下载中，输出到：{out_root}")
+        self._show("progress")
         threading.Thread(target=self._download_worker, args=(vols, out_root),
                          daemon=True).start()
 
@@ -302,12 +454,11 @@ class DownloaderGUI:
             log.exception("下载失败")
             self.msgq.put(("dl_err", str(exc)))
 
-    # ---------------- 队列轮询（主线程刷新 UI）----------------
+    # ---------------- 队列轮询 ----------------
     def _drain(self):
         try:
             while True:
-                msg = self.msgq.get_nowait()
-                self._handle(msg)
+                self._handle(self.msgq.get_nowait())
         except queue.Empty:
             pass
         self.root.after(120, self._drain)
@@ -317,12 +468,11 @@ class DownloaderGUI:
         if kind == "parse_done":
             self.busy = False
             self.btn_parse.configure(state="normal", text="解析")
-            self.var_status.set("解析完成，请选择要下载的章。")
             self._render_book(msg[1])
         elif kind == "parse_err":
             self.busy = False
             self.btn_parse.configure(state="normal", text="解析")
-            self.var_status.set("解析失败。")
+            self.var_empty.set("解析失败：" + msg[1])
             messagebox.showerror("解析失败", msg[1])
         elif kind == "v_total":
             self._set_prog(msg[1], total=msg[2])
@@ -334,18 +484,15 @@ class DownloaderGUI:
             self._set_prog(msg[1], phase="done" if msg[2] else "empty", name=msg[2])
         elif kind == "all_done":
             self.busy = False
-            self.btn_start.configure(state="normal")
-            self.btn_parse.configure(state="normal")
+            self.btn_reveal.configure(state="normal")
+            self.nav_btn.configure(state="normal")
             self.var_status.set(f"全部完成 → {msg[1]}")
             messagebox.showinfo("完成", f"下载完成，已保存到：\n{msg[1]}")
         elif kind == "dl_err":
             self.busy = False
-            self.btn_start.configure(state="normal")
-            self.btn_parse.configure(state="normal")
-            self.var_status.set("下载出错。")
+            self.nav_btn.configure(state="normal")
+            self.var_status.set("下载出错：" + msg[1])
             messagebox.showerror("下载出错", msg[1])
-
-    _prog_state: dict = {}
 
     def _set_prog(self, vidx, total=None, inc=0, phase=None, name=None):
         iid = self.prog_rows.get(vidx)
@@ -365,19 +512,32 @@ class DownloaderGUI:
             prog_txt = f"{st['done']}/{st['total']}"
         else:
             prog_txt = ""
-        self.tree.item(iid, values=(label, prog_txt))
+        self.tree.item(iid, values=(label, prog_txt), tags=(st["phase"],))
+
+    def _reveal(self):
+        import subprocess
+        import sys
+        p = self.config.output_path()
+        try:
+            if sys.platform == "darwin":
+                subprocess.Popen(["open", str(p)])
+            elif sys.platform.startswith("win"):
+                subprocess.Popen(["explorer", str(p)])
+            else:
+                subprocess.Popen(["xdg-open", str(p)])
+        except Exception:
+            pass
 
     # ---------------- 关闭 ----------------
     def _on_close(self):
-        if self.busy and not messagebox.askokcancel("退出", "下载仍在进行，确定退出？"):
+        if self.busy and not messagebox.askokcancel("退出", "任务仍在进行，确定退出？"):
             return
         self._reset_net()
         self.root.destroy()
 
 
 def _force_repaint(root: tk.Tk) -> None:
-    """修复 macOS(尤其旧版 Tk 8.5)首次打开窗口内容空白、不重绘的老问题：
-    置顶取焦点 + 轻微改一下窗口尺寸再改回，逼 Tk 触发一次重绘。"""
+    """修复 macOS(尤其旧 Tk 8.5)首次打开窗口内容空白、不重绘的老问题。"""
     try:
         root.update_idletasks()
         root.lift()

@@ -34,6 +34,13 @@ volume into **EPUB** or **PDF**.
 > Requires **Chrome or Edge** installed locally (used to pass Cloudflare). The first parse launches the
 > browser and takes ~10–20 s. On macOS, if Gatekeeper blocks the first launch, allow it via
 > System Settings → Privacy & Security → "Open Anyway".
+>
+> **About the macOS permission prompt on step 2 ("Parse")**: passing Cloudflare requires launching your
+> local Chrome, and this app isn't Apple-signed/notarized, so macOS shows a one-time privacy prompt asking
+> whether to let it access/control another app — **just click "Allow" once** and it won't ask again. If you
+> accidentally clicked "Don't Allow" and it then can't reach the browser, re-enable
+> **Bilimanga-Downloader** under System Settings → Privacy & Security → "App Management" (or "Automation").
+> This doesn't affect downloading itself — it's just macOS's routine check for un-notarized apps.
 
 ## 2. CLI / from source
 
