@@ -155,6 +155,41 @@ class _State:
                 pass
 
 
+# ---------------- 输入归类（域名优先，避免书号跨站撞车）----------------
+def _classify_input(raw: str, default_is_novel: bool):
+    """把用户输入归类为 (is_novel, book_no)。
+
+    关键：**完整网址以域名为准**决定是漫画还是轻小说——
+    ``bilinovel.com/novel/3`` 与 ``bilimanga.net/detail/3`` 是两本不同的书，
+    只靠书号会撞车。裸书号则沿用上一步所选类型。
+    """
+    from .novel import parse_novel_no
+    s = (raw or "").strip()
+    low = s.lower()
+    is_url = ("://" in low) or ("." in low and "/" in low)
+    novel_site = "bilinovel.com" in low or "linovelib.com" in low or "linovelib" in low
+    manga_site = "bilimanga.net" in low or "bilicomic.net" in low or "bilicomic" in low
+    novel_path = "/novel/" in low
+    manga_path = "/detail/" in low or "/read/" in low
+    is_novel = novel_site or (novel_path and not manga_site)
+    is_manga = manga_site or (manga_path and not novel_site)
+
+    if is_novel and not is_manga:
+        return True, parse_novel_no(s)
+    if is_manga and not is_novel:
+        return False, parse_book_no(s)
+    if s.isdigit():
+        return default_is_novel, s
+    if is_url:
+        raise ValueError(
+            "无法识别该网址属于哪个站点。请粘贴完整网址：\n"
+            "  轻小说 https://www.bilinovel.com/novel/3.html\n"
+            "  漫画   https://www.bilimanga.net/detail/703.html\n"
+            "或直接输入书号（按上一步所选类型处理）。")
+    # 非 URL 且非纯数字：按默认类型尽力解析
+    return default_is_novel, (parse_novel_no(s) if default_is_novel else parse_book_no(s))
+
+
 # ---------------- 各步骤 ----------------
 def _step_kind(st: _State) -> str:
     _clear()
@@ -180,7 +215,9 @@ def _step_input(st: _State) -> str:
         _print("示例：轻小说链接 https://www.bilinovel.com/novel/2139.html 或书号 2139")
     else:
         _print("示例：漫画链接 https://www.bilimanga.net/detail/703.html 或书号 703")
-    raw = _ask_text("→ 粘贴链接或书号（b=返回）：")
+    _print("[dim]提示：不同站点的书号会撞车（如 novel/3 与 detail/3 不是同一本），"
+           "粘贴完整网址最稳妥。[/dim]")
+    raw = _ask_text("→ 粘贴完整网址或书号（b=返回）：")
     if raw is None:
         return QUIT
     raw = raw.strip()
@@ -191,12 +228,16 @@ def _step_input(st: _State) -> str:
         _pause("按回车重试……")
         return GO_BACK
     try:
-        from .novel import parse_novel_no
-        st.book_no = parse_novel_no(raw) if st.is_novel else parse_book_no(raw)
+        is_novel, book_no = _classify_input(raw, st.is_novel)
     except ValueError as exc:
         _print(f"[red]{exc}[/red]")
         _pause("按回车重试……")
         return GO_BACK
+    if is_novel != st.is_novel:
+        kind = "轻小说" if is_novel else "漫画"
+        _print(f"[yellow]该网址属于{kind}站，已按{kind}处理。[/yellow]")
+        st.is_novel = is_novel
+    st.book_no = book_no
     return NEXT
 
 
@@ -459,12 +500,10 @@ def _run_flow(st: _State, start_at: int = 0) -> None:
 
 
 def run_download(config: Config, url_or_no: str) -> None:
-    """命令行直接下载：自动判类型，从“确认”步进入交互流程。"""
-    from .novel import is_novel_url, parse_novel_no
+    """命令行直接下载：按网址域名判类型（裸书号默认漫画），从“确认”步进入。"""
     st = _State(config)
-    st.is_novel = is_novel_url(url_or_no)
     try:
-        st.book_no = parse_novel_no(url_or_no) if st.is_novel else parse_book_no(url_or_no)
+        st.is_novel, st.book_no = _classify_input(url_or_no, default_is_novel=False)
     except ValueError as exc:
         _print(f"[red]{exc}[/red]")
         return
