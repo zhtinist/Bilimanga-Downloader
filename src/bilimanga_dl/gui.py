@@ -268,14 +268,9 @@ class DownloaderGUI:
         self._label(f, "下载线程数自动调节（4 起步），无需设置。",
                     fg=MUTED, font=FONT_SM).grid(row=5, column=0, columnspan=3, sticky="w",
                                                  padx=8, pady=(0, 4))
-        # 轻小说需要登录 linovelib 才能读正文：一次性登录，登录态会被记住。
-        loginrow = self._frame(f)
-        loginrow.grid(row=6, column=0, columnspan=3, sticky="ew", padx=8, pady=(2, 10))
-        loginrow.columnconfigure(0, weight=1)
-        self._label(loginrow, "轻小说需登录 linovelib（漫画不需要）：",
-                    fg=MUTED, font=FONT_SM).grid(row=0, column=0, sticky="w")
-        self.btn_login = ttk.Button(loginrow, text="登录轻小说", command=self._login_novel)
-        self.btn_login.grid(row=0, column=1, sticky="e")
+        self._label(f, "轻小说粘贴 linovelib 链接即可，无需登录；若提示被限流，稍等几分钟重试。",
+                    fg=MUTED, font=FONT_SM).grid(row=6, column=0, columnspan=3, sticky="w",
+                                                 padx=8, pady=(0, 12))
         self._refresh_hint()
 
         ttk.Button(f, text="保存设置", style="Accent.TButton", command=self._save_cfg).grid(
@@ -369,31 +364,6 @@ class DownloaderGUI:
             self.config.save()
             self._refresh_hint()
             self._show("home")
-
-    def _finish_login(self):
-        try:
-            if self.net:
-                self.net.finish_login()
-        except Exception:  # noqa: BLE001
-            pass
-        self.msgq.put(("login_done",))
-
-    def _login_novel(self):
-        if self.busy:
-            return
-        self.busy = True
-        self.btn_login.configure(state="disabled", text="打开中…")
-        self._apply_cfg()
-
-        def worker():
-            try:
-                self._ensure_net()
-                self.net.open_login("https://www.linovelib.com/")
-                self.msgq.put(("login_opened",))
-            except Exception as exc:  # noqa: BLE001
-                self.msgq.put(("login_err", str(exc)))
-
-        threading.Thread(target=worker, daemon=True).start()
 
     # ---------------- 解析 ----------------
     def _on_parse(self):
@@ -539,20 +509,6 @@ class DownloaderGUI:
             self._set_prog(msg[1], phase=msg[2])
         elif kind == "v_done":
             self._set_prog(msg[1], phase="done" if msg[2] else "empty", name=msg[2])
-        elif kind == "login_opened":
-            self.busy = False
-            self.btn_login.configure(state="normal", text="登录轻小说")
-            messagebox.showinfo(
-                "登录轻小说",
-                "已打开浏览器窗口，请在其中登录 linovelib（哔哩轻小说）。\n"
-                "登录成功后回到这里点“确定”，程序会记住登录状态，之后下载全程无需再登录。")
-            threading.Thread(target=self._finish_login, daemon=True).start()
-        elif kind == "login_err":
-            self.busy = False
-            self.btn_login.configure(state="normal", text="登录轻小说")
-            messagebox.showerror("登录失败", msg[1])
-        elif kind == "login_done":
-            self.var_hint.set("✅ 轻小说登录已保存，可直接下载。")
         elif kind == "concurrency":
             self.var_conc.set(f"🧵 并发线程：{msg[1]}")
         elif kind == "all_done":

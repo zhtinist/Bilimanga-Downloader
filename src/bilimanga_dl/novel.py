@@ -15,6 +15,7 @@ from __future__ import annotations
 import io
 import re
 import threading
+import time
 import zipfile
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -33,13 +34,13 @@ log = get_logger("novel")
 NOVEL_SITE = "https://www.linovelib.com"
 IMG_HOST = "https://img3.readpai.com"
 COLOR_CHAP_NAME = "插图"
-# 未登录/无权限时 linovelib 返回的占位提示特征
+# linovelib 请求过快时的占位提示特征（其实是限流，不是需要登录；退避重试即可）
 _LOCK_MARKERS = ("沒有可閱讀的章節內容", "没有可阅读的章节内容", "需要足夠的權限",
                  "需要足够的权限", "審核未通過", "审核未通过")
 
 
-class NovelLoginRequired(RuntimeError):
-    """linovelib 需要登录后才能读取正文。"""
+class NovelRateLimited(RuntimeError):
+    """linovelib 暂时限制访问（占位页）。"""
 
 _CHINESE_PUNCT = set(
     "，。！？、；：“”‘’（）《》〈〉【】『』〖〗…—～＋－＝×÷·「」　 "
@@ -272,13 +273,14 @@ class NovelDownloader:
                 log.warning("章节 %r 抓取失败：%s", chap.title, exc)
                 body = ""
             chapters_out.append((chap.title, body))
+            time.sleep(0.6)  # 章节间稍作停顿，避免触发 linovelib 限流
 
         has_text = any(b.strip() for _, b in chapters_out)
         if not has_text and len(img_map) <= 1:
             if any_gated:
-                raise NovelLoginRequired(
-                    "linovelib 需要登录后才能读取正文。请到「设置 → 登录轻小说」登录一次，"
-                    "登录状态会被记住，之后即可正常下载。")
+                raise NovelRateLimited(
+                    "linovelib 暂时限制了访问（返回占位页，通常是请求过于频繁）。"
+                    "已自动退避重试仍未成功，请**稍等几分钟再重试**；无需登录。")
             if on_phase:
                 on_phase(vidx, "empty")
             return None

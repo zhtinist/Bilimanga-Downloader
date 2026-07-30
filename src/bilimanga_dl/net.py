@@ -332,26 +332,39 @@ class BrowserEngine:
         data-* 键值，把所有同键值的 p 从 DOM 里删掉；再清掉残留 data-* 属性。
         """
         from bs4 import BeautifulSoup
+        # linovelib 请求过快时会返回“需要足夠的權限/審核未通過”这类占位页（其实是限流，
+        # 并非需要登录）。这里像参考项目对付 Cloudflare 那样：检测到就退避后重试。
+        rate_markers = ("需要足夠的權限", "需要足够的权限", "審核未通過", "审核未通过",
+                        "沒有可閱讀的章節內容", "没有可阅读的章节内容")
         tab = self._borrow()
         try:
-            tab.get(url)
-            deadline = time.time() + self.config.cloudflare_wait
-            html = tab.html or ""
-            state = _html_state(html)
-            while state == "challenge" and time.time() < deadline:
-                time.sleep(1.0)
+            html = ""
+            for attempt in range(5):
+                tab.get(url)
+                deadline = time.time() + self.config.cloudflare_wait
                 html = tab.html or ""
                 state = _html_state(html)
-            if state == "blocked":
-                raise CloudflareBlocked(f"该 IP 被 Cloudflare 硬封禁: {url}")
-            if state == "challenge":
-                raise CloudflareBlocked(f"等待 {self.config.cloudflare_wait}s 仍未通过 Cloudflare: {url}")
-            # 等正文容器渲染 + 给 JS 一点注入时间
-            wd = time.time() + 15
-            while "TextContent" not in (tab.html or "") and time.time() < wd:
-                time.sleep(0.5)
-            time.sleep(2.0)
-            html = tab.html or ""
+                while state == "challenge" and time.time() < deadline:
+                    time.sleep(1.0)
+                    html = tab.html or ""
+                    state = _html_state(html)
+                if state == "blocked":
+                    raise CloudflareBlocked(f"该 IP 被 Cloudflare 硬封禁: {url}")
+                if state == "challenge":
+                    raise CloudflareBlocked(
+                        f"等待 {self.config.cloudflare_wait}s 仍未通过 Cloudflare: {url}")
+                # 等正文容器渲染 + 给 JS 一点注入时间
+                wd = time.time() + 15
+                while "TextContent" not in (tab.html or "") and time.time() < wd:
+                    time.sleep(0.5)
+                time.sleep(2.0)
+                html = tab.html or ""
+                if any(m in html for m in rate_markers) and attempt < 4:
+                    wait = 5 + attempt * 4
+                    log.warning("[browser] 疑似被限流(占位页)，%ds 后重试(%d/5): %s", wait, attempt + 1, url)
+                    time.sleep(wait)
+                    continue
+                break
             bf = BeautifulSoup(html, "html.parser")
             # ① 用计算样式找诱饵 p，按 data-* 键值批量删除
             try:
