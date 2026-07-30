@@ -42,7 +42,7 @@ jobs:
         if: runner.os == 'macOS'
         run: |
           cd dist
-          zip -ry ../${{ matrix.asset }} "Bilimanga-Downloader.app"
+          zip -ry ../${{ matrix.asset }} "Bilimanga-Downloader"
 
       - name: Package (Windows)
         if: runner.os == 'Windows'
@@ -67,10 +67,10 @@ jobs:
           files: artifacts/**/*.zip
           generate_release_notes: true
           body: |
-            双击即用，无需本地 Python（需本机已装 Chrome/Edge 以过 Cloudflare）。
+            双击即用，无需本地 Python（漫画需本机已装 Chrome/Edge 以过 Cloudflare；轻小说走手机站直连，一般无需浏览器）。
 
-            - macOS：下载 `Bilimanga-Downloader-macOS.zip`，解压后双击 `Bilimanga-Downloader.app`。
+            - macOS：下载 `Bilimanga-Downloader-macOS.zip`，解压后双击文件夹内的 `Bilimanga-Downloader`（会打开终端运行）。
               首次打开若被 Gatekeeper 拦，在「系统设置 → 隐私与安全性」点「仍要打开」。
             - Windows：下载 `Bilimanga-Downloader-Windows.zip`，解压后双击 `Bilimanga-Downloader.exe`。
 
-            启动后打开一个独立的原生程序窗口（不开浏览器、不起本地服务）。下载目录默认用系统下载文件夹 `~/Downloads`，可在「设置」里修改。
+            启动后在终端里交互：先选「漫画 / 轻小说」，输入链接或书号，方向键勾选要下的卷。下载目录默认系统下载文件夹 `~/Downloads`，可用 `--out` 指定。

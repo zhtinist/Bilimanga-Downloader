@@ -72,7 +72,8 @@ def main() -> int:
         "--name", NAME,
         "--noconfirm",
         "--clean",
-        "--windowed",                 # 双击不弹终端窗口（GUI 应用）
+        # 控制台应用：双击在终端里跑交互式命令行下载器（无图形界面）。
+        "--console",
         "--onedir",                   # 目录形式：启动快、体积友好
         "--paths", str(SRC),
         "--distpath", str(ROOT / "dist"),
@@ -89,18 +90,12 @@ def main() -> int:
         "--hidden-import", "bs4",
         "--hidden-import", "lxml",
     ]
-    # 封面图：随包内置（供 GUI 显示 + 窗口图标），并尽量转成可执行文件图标。
+    # 封面图转成可执行文件图标（有则用，无则跳过，不影响打包）。
     cover = ROOT / "resource" / "app_cover.png"
     if cover.exists():
-        sep = ";" if sys.platform.startswith("win") else ":"
-        args += ["--add-data", f"{cover}{sep}resource"]
         icon = _make_icon(cover)
         if icon:
             args += ["--icon", str(icon)]
-
-    # macOS：给 .app 一个更友好的 bundle id
-    if sys.platform == "darwin":
-        args += ["--osx-bundle-identifier", "net.bilimanga.downloader"]
 
     import PyInstaller.__main__ as pyi
     pyi.run(args)
