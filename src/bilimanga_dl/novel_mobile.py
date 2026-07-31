@@ -19,6 +19,7 @@ import re
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, List, Optional, Tuple
 
@@ -47,6 +48,18 @@ _BLOCK_MARKERS = ("Just a moment", "Attention Required", "Access denied",
 def is_mobile_novel_url(text: str) -> bool:
     t = (text or "").lower()
     return "bilinovel.com" in t or "linovelib" in t or "/novel/" in t
+
+
+@dataclass
+class _VolumeContent:
+    """一卷抓取完成后的中间产物：正文（含图片占位）+ 图片编号表 + 是否被限流。"""
+    chapters: List[Tuple[str, str]] = field(default_factory=list)  # (章名, 正文html)
+    img_map: dict = field(default_factory=dict)                    # 图片URL -> 编号
+    any_gated: bool = False
+
+    @property
+    def has_text(self) -> bool:
+        return any(b.strip() for _, b in self.chapters)
 
 
 class MobileNovelDownloader:
@@ -208,7 +221,7 @@ class MobileNovelDownloader:
                     out.append(f"<p>{_esc(txt)}</p>")
         return "\n".join(out)
 
-    # ---- 下载一卷 → EPUB ----
+    # ---- 下载一卷 → EPUB（三段流水线：抓正文 → 下插图 → 打包）----
     def download_volume(self, book: Book, volume: Volume, out_dir: Path,
                         on_phase: Optional[Callable] = None,
                         on_total: Optional[Callable] = None,
@@ -217,9 +230,30 @@ class MobileNovelDownloader:
         vidx = volume.index
         if on_phase:
             on_phase(vidx, "download")
-        if on_concurrency:
-            on_concurrency(vidx, self._gate._sem._value if hasattr(self._gate._sem, "_value") else self.num_thread)
 
+        content = self._fetch_bodies(volume, on_total, on_image)
+        if not content.has_text and len(content.img_map) <= 1:
+            if content.any_gated:
+                raise NovelRateLimited(
+                    "手机站暂时限制了访问（占位页，通常是请求过于频繁）。"
+                    "已自动退避重试仍未成功，请稍等几分钟再重试。")
+            if on_phase:
+                on_phase(vidx, "empty")
+            return None
+
+        if on_phase:
+            on_phase(vidx, "images")
+        images = self._download_images(content.img_map, vidx, on_image)
+
+        if on_phase:
+            on_phase(vidx, "package")
+        return _build_epub(book, volume, content.chapters, images, out_dir)
+
+    # ---- 阶段 1：抓正文（并发受 _gate 控制，默认串行以尊重限流）----
+    def _fetch_bodies(self, volume: Volume,
+                      on_total: Optional[Callable],
+                      on_image: Optional[Callable]) -> "_VolumeContent":
+        vidx = volume.index
         jobs = [(i, ch) for i, ch in enumerate(volume.chapters) if ch.url]
         names = [ch.title for _, ch in jobs]
         bodies: dict = {}
@@ -231,39 +265,28 @@ class MobileNovelDownloader:
         def _fetch(job):
             i, ch = job
             try:
-                body, gated = self._chap_text(ch)
-                bodies[i] = body
-                gated_flags[i] = gated
+                bodies[i], gated_flags[i] = self._chap_text(ch)
             except Exception as exc:  # noqa: BLE001
                 log.warning("章节 %r 抓取失败：%s", ch.title, exc)
-                bodies[i] = ""
-                gated_flags[i] = True
+                bodies[i], gated_flags[i] = "", True
             if on_image:      # 每抓完一章推进一格
                 on_image(vidx)
 
-        # 正文抓取的并发由 _gate 控制（默认串行），这里线程数只是取任务方便。
         with ThreadPoolExecutor(max_workers=max(self.num_thread, 1)) as pool:
             list(pool.map(_fetch, jobs))
 
         ordered = [bodies.get(i, "") for i, _ in jobs]
         ordered, img_map = NovelDownloader._assign_images(ordered)
-        chapters_out: List[Tuple[str, str]] = list(zip(names, ordered))
-        any_gated = any(gated_flags.values())
+        return _VolumeContent(chapters=list(zip(names, ordered)),
+                              img_map=img_map,
+                              any_gated=any(gated_flags.values()))
 
-        has_text = any(b.strip() for _, b in chapters_out)
-        if not has_text and len(img_map) <= 1:
-            if any_gated:
-                raise NovelRateLimited(
-                    "手机站暂时限制了访问（占位页，通常是请求过于频繁）。"
-                    "已自动退避重试仍未成功，请稍等几分钟再重试。")
-            if on_phase:
-                on_phase(vidx, "empty")
-            return None
-
-        # 插图（并发下载；readpai/站点图床走 CDN，不做防盗链）
-        if on_phase:
-            on_phase(vidx, "images")
+    # ---- 阶段 2：下插图并转码 JPEG（异源 CDN，与限流无关，可并发）----
+    def _download_images(self, img_map: dict, vidx: int,
+                         on_image: Optional[Callable]) -> dict:
         images: dict = {}
+        if not img_map:
+            return images
         lock = threading.Lock()
 
         def _dl(item):
@@ -284,13 +307,9 @@ class MobileNovelDownloader:
             if on_image:
                 on_image(vidx)
 
-        if img_map:
-            with ThreadPoolExecutor(max_workers=self.num_thread) as pool:
-                list(pool.map(_dl, img_map.items()))
-
-        if on_phase:
-            on_phase(vidx, "package")
-        return _build_epub(book, volume, chapters_out, images, out_dir)
+        with ThreadPoolExecutor(max_workers=self.num_thread) as pool:
+            list(pool.map(_dl, img_map.items()))
+        return images
 
     def close(self) -> None:
         try:
