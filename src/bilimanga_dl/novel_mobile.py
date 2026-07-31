@@ -289,16 +289,23 @@ class MobileNovelDownloader:
             return images
         lock = threading.Lock()
 
-        def _dl(item):
+        def _dl(item, tries=3):
             url, idx = item
             data = None
-            try:
-                r = self.session.get(url, timeout=self._to)
-                if r.status_code == 200 and r.content:
-                    data = r.content
-            except cffi_exc.RequestException as exc:
-                log.warning("插图 %s 下载失败：%s", idx, exc)
-            if data is not None:
+            # 就地补图（边下边检测）：失败即退避重试，和其它图并发进行。
+            for attempt in range(tries):
+                try:
+                    r = self.session.get(url, timeout=self._to)
+                    if r.status_code == 200 and r.content:
+                        data = r.content
+                        break
+                except cffi_exc.RequestException:
+                    pass
+                if attempt < tries - 1:
+                    time.sleep(0.4 * (attempt + 1))
+            if data is None:
+                log.warning("插图 %s 多次下载失败", idx)
+            else:
                 try:
                     with lock:
                         images[idx] = _to_jpeg(data)

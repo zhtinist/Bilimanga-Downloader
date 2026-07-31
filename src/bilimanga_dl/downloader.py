@@ -360,19 +360,28 @@ class Downloader:
         outputs: list = []
         out_lock = threading.Lock()
 
-        def _fetch(u, dest, ref):
-            limiter.acquire()
-            ok = False
-            try:
-                if not (self.config.resume_enabled and self._valid_jpeg(dest)):
-                    try:
-                        self._download_one(u, dest, ref)
-                    except Exception:
-                        pass
-                ok = self._valid_jpeg(dest)
-            finally:
-                limiter.release(ok)
-            return ok
+        def _fetch(u, dest, ref, tries=3):
+            # 就地补图（边下边检测）：某张失败即在本任务内退避重试，
+            # 与其它并发下载的图重叠进行，不必等整波结束再回头补。
+            for attempt in range(tries):
+                limiter.acquire()
+                ok = False
+                try:
+                    if self.config.resume_enabled and self._valid_jpeg(dest):
+                        ok = True
+                    else:
+                        try:
+                            self._download_one(u, dest, ref)
+                        except Exception:
+                            pass
+                        ok = self._valid_jpeg(dest)
+                finally:
+                    limiter.release(ok)
+                if ok:
+                    return True
+                if attempt < tries - 1:
+                    time.sleep(0.4 * (attempt + 1))  # 退避后就地再试
+            return False
 
         def _finalize(vidx, dv):
             # Agent2：本地校对（不联网，查缺失/空文件）
@@ -431,8 +440,10 @@ class Downloader:
                         on_image(vidx)
                     return t, ok
 
+                # 每张图已在 _fetch 里就地重试；这里的外层轮次只作兜底安全网
+                # （应对限流冷却时间超过单张重试预算的极端情况）。
                 pending = list(tasks)
-                for _round in range(4):
+                for _round in range(2):
                     if not pending:
                         break
                     futs = [img_pool.submit(_one, t) for t in pending]
@@ -443,7 +454,7 @@ class Downloader:
                             pass
                     pending = [t for t in tasks if not self._valid_file(t[1])]
                     if pending:
-                        time.sleep(1.0)  # 退避后重试缺失
+                        time.sleep(1.0)  # 兜底轮次间退避
 
                 # 下完 → 交后台校对+打包（与下一卷下载重叠）
                 pkg_futures.append(pkg_pool.submit(_finalize, v.index, dv))
