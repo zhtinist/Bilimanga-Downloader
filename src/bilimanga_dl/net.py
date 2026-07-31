@@ -50,6 +50,7 @@ def ensure_local_no_proxy() -> None:
 from .config import Config
 from .imageutil import save_as_jpeg
 from .logutil import get_logger
+from .ratelimit import RateGate
 
 log = get_logger("net")
 
@@ -58,6 +59,34 @@ USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 )
+# 手机 UA：实测 bilimanga 手机站直连（目录/阅读页/图片 CDN）用它即可，无需浏览器。
+MOBILE_UA = (
+    "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36"
+)
+
+
+def _origin(url: str) -> str:
+    p = urlparse(url or "")
+    return f"{p.scheme}://{p.netloc}" if p.scheme else ""
+
+
+def _image_headers(referer: Optional[str]) -> dict:
+    """图片 CDN 需要完整的浏览器指纹头，否则 Cloudflare 返回 403（非 JS 质询）。"""
+    h = {
+        "User-Agent": MOBILE_UA,
+        "Accept": "image/avif,image/webp,image/apng,*/*;q=0.8",
+        "Accept-Language": "zh-CN,zh;q=0.9",
+        "Sec-Fetch-Dest": "image",
+        "Sec-Fetch-Mode": "no-cors",
+        "Sec-Fetch-Site": "cross-site",
+    }
+    if referer:
+        h["Referer"] = referer
+        o = _origin(referer)
+        if o:
+            h["Origin"] = o
+    return h
 
 # 软性质询特征（浏览器会自动解算）。只用 interstitial 独有的串，
 # 不用 challenge-platform / __cf_chl（这些是 Cloudflare 的 beacon，正常页也可能带，会误判）。
@@ -576,15 +605,42 @@ class Net:
         ensure_local_no_proxy()  # 本地 CDP/请求绕过代理，避免被系统代理劫持
         self.config = config
         self.session = requests.Session()
-        self.session.headers.update({"User-Agent": USER_AGENT, "Cookie": "night=1"})
+        self.session.headers.update({"User-Agent": MOBILE_UA, "Cookie": "night=0",
+                                     "Accept-Language": "zh-CN,zh;q=0.9"})
         self.base_url: Optional[str] = None
         self._lock = threading.Lock()
         self._last_request_ts = 0.0
         self._proxy_disabled = False
         self._apply_proxy()
-        self.browser: Optional[BrowserEngine] = (
-            BrowserEngine(config) if config.use_browser else None
-        )
+        # 共享节流器：命中 429 时全体线程一起冷却（跨卷/跨本复用同一个桶）。
+        self._gate = RateGate(min_interval=0.25, concurrency=6)
+        # 浏览器**惰性启动**：默认走无浏览器直连，只有真的撞上 Cloudflare 质询才
+        # 按需启动 Chrome 过验证；一旦启动就长期复用（下多本不再重复等待验证）。
+        self._want_browser = config.use_browser
+        self._browser: Optional[BrowserEngine] = None
+        self._browser_lock = threading.Lock()
+        self._browser_failed = False
+
+    @property
+    def browser(self) -> Optional[BrowserEngine]:
+        """已启动的浏览器引擎（未启动则为 None，不触发启动）。"""
+        return self._browser
+
+    def _ensure_browser(self) -> Optional[BrowserEngine]:
+        """按需启动并复用浏览器；不允许/启动失败则返回 None。"""
+        if self._browser is not None:
+            return self._browser
+        if not self._want_browser or self._browser_failed:
+            return None
+        with self._browser_lock:
+            if self._browser is None and not self._browser_failed:
+                try:
+                    log.info("检测到需要过 Cloudflare，正在启动浏览器（仅首次）……")
+                    self._browser = BrowserEngine(self.config)
+                except Exception as exc:  # noqa: BLE001
+                    self._browser_failed = True
+                    log.warning("浏览器启动失败：%s", exc)
+        return self._browser
 
     # ---- 代理 ----
     def _apply_proxy(self) -> None:
@@ -599,36 +655,25 @@ class Net:
         self.session.trust_env = False
         self.session.proxies = {"http": None, "https": None}
 
-    # ---- 限速 ----
-    def _throttle(self) -> None:
-        if not self.config.rate_limit_enabled:
-            return
-        with self._lock:
-            wait = random.uniform(
-                self.config.rate_limit_min_ms / 1000.0,
-                self.config.rate_limit_max_ms / 1000.0,
-            )
-            elapsed = time.monotonic() - self._last_request_ts
-            if elapsed < wait:
-                time.sleep(wait - elapsed)
-            self._last_request_ts = time.monotonic()
-
-    # ---- requests 抓取（带重试/退避/代理回退，不含 CF 兜底）----
+    # ---- requests 抓取（限速 + 429 冷却 + 重试/代理回退；CF 质询交上层用浏览器）----
     def _requests_fetch(self, url: str, *, referer: Optional[str] = None,
-                        stream: bool = False) -> requests.Response:
-        headers = {}
-        if referer:
-            headers["Referer"] = referer
+                        stream: bool = False, headers: Optional[dict] = None,
+                        timeout: Optional[float] = None) -> requests.Response:
+        hdrs = dict(headers or {})
+        if referer and "Referer" not in hdrs:
+            hdrs["Referer"] = referer
         attempts = self.config.retry_max_attempts if self.config.retry_enabled else 1
+        attempts = max(attempts, 6)  # 保证有足够次数熬过 429 冷却
         last_exc: Optional[Exception] = None
+        to = timeout or (8, min(self.config.request_timeout, 20))
         attempt = 0
         while attempt < attempts:
-            self._throttle()
-            log.debug("GET %s (第 %d/%d 次, stream=%s)", url, attempt + 1, attempts, stream)
+            self._gate.acquire()
             try:
-                resp = self.session.get(url, headers=headers,
-                                        timeout=self.config.request_timeout, stream=stream)
+                resp = self.session.get(url, headers=hdrs, timeout=to, stream=stream)
+                status = resp.status_code
             except requests.exceptions.ProxyError as exc:
+                self._gate.release()
                 last_exc = exc
                 log.warning("代理连接失败 %s: %s", url, exc)
                 if not self._proxy_disabled and not self.config.proxy:
@@ -636,51 +681,60 @@ class Net:
                     log.warning("检测到代理不可用，自动改为【直连】重试……")
                     continue
                 attempt += 1
+                continue
             except requests.RequestException as exc:
+                self._gate.release()
                 last_exc = exc
                 log.warning("请求异常 %s: %s", url, exc)
                 attempt += 1
+                continue
             else:
+                self._gate.release()
                 attempt += 1
-                log.debug("← %s status=%s", url, resp.status_code)
-                if resp.status_code == 200:
+                log.debug("← %s status=%s", url, status)
+                if status == 200:
+                    self._gate.reward()
                     return resp
-                last_exc = requests.HTTPError(f"HTTP {resp.status_code}: {url}")
-                if _looks_like_cloudflare("" if stream else resp.text, resp.status_code):
-                    last_exc = CloudflareBlocked(f"requests 被 Cloudflare 拦截: {url}")
-                    break  # requests 过不了，交给上层用浏览器
+                last_exc = requests.HTTPError(f"HTTP {status}: {url}")
+                # 429 / 占位限流：全体冷却后重试（不交给浏览器，纯粹是限速）。
+                if status == 429:
+                    cooldown = min(15 + attempt * 8, 45)
+                    self._gate.penalize(cooldown)
+                    log.warning("触发限流(429)，全体冷却 %ds 后重试(%d/%d): %s",
+                                cooldown, attempt, attempts, url)
+                    continue
+                # Cloudflare JS 质询：requests 过不了，交给上层用浏览器。
+                if _looks_like_cloudflare("" if stream else resp.text, status):
+                    raise CloudflareBlocked(f"requests 被 Cloudflare 拦截: {url}")
             if self.config.retry_enabled and attempt < attempts:
                 backoff = self.config.retry_backoff_base * (2 ** (attempt - 1))
                 backoff += random.uniform(0, 0.5)
-                log.debug("退避 %.2fs 后重试", backoff)
-                time.sleep(backoff)
+                time.sleep(min(backoff, 10))
         raise last_exc or RuntimeError(f"请求失败: {url}")
 
     # ---- 对外 API ----
     def warm_up(self, url: Optional[str] = None) -> None:
-        """在后台线程启动并预热浏览器（供确认阶段并行准备，用户体感更快）。"""
-        if not self.browser:
-            return
-        threading.Thread(target=self.browser.prewarm, args=(url,), daemon=True).start()
+        """惰性浏览器模式下无需预热（默认直连）；已启动浏览器时才后台预热。"""
+        if self._browser is not None:
+            threading.Thread(target=self._browser.prewarm, args=(url,),
+                             daemon=True).start()
 
     def open_login(self, url: str) -> None:
-        """打开有头浏览器让用户登录（轻小说站点需要）。无浏览器模式下无操作。"""
-        if self.browser:
-            self.browser.open_login(url)
+        """打开有头浏览器让用户登录（轻小说站点需要）。"""
+        br = self._ensure_browser()
+        if br:
+            br.open_login(url)
 
     def finish_login(self) -> None:
-        if self.browser:
-            self.browser.finish_login()
+        if self._browser:
+            self._browser.finish_login()
 
     def resolve_base_url(self) -> str:
         if self.base_url:
             return self.base_url
         m = self.config.site
         try:
-            if self.browser:
-                self.browser.get_html(m + "/")
-            else:
-                self._requests_fetch(m + "/")
+            self.get_text(m + "/")
             self.base_url = m
             log.info("使用站点: %s", m)
             return m
@@ -693,31 +747,48 @@ class Net:
 
     def get_text(self, url: str, *, referer: Optional[str] = None,
                  wait_for: Optional[str] = None) -> str:
-        if self.browser:
-            return self.browser.get_html(url, wait_for=wait_for)
-        resp = self._requests_fetch(url, referer=referer)
-        resp.encoding = resp.apparent_encoding or "utf-8"
-        return resp.text
+        """优先无浏览器直连；撞上 Cloudflare 质询才启动/复用浏览器过验证。"""
+        try:
+            resp = self._requests_fetch(url, referer=referer)
+            resp.encoding = resp.apparent_encoding or "utf-8"
+            return resp.text
+        except CloudflareBlocked:
+            br = self._ensure_browser()
+            if br is None:
+                raise
+            return br.get_html(url, wait_for=wait_for)
 
     def get_novel_text(self, url: str, *, referer: Optional[str] = None) -> str:
-        """轻小说阅读页 HTML（浏览器模式做诱饵段落清理；无浏览器时退回纯 requests）。"""
-        if self.browser:
-            return self.browser.get_novel_html(url)
-        resp = self._requests_fetch(url, referer=referer)
-        resp.encoding = resp.apparent_encoding or "utf-8"
-        return resp.text
+        """轻小说阅读页 HTML（无浏览器直连；撞 CF 才用浏览器做诱饵段落清理）。"""
+        try:
+            resp = self._requests_fetch(url, referer=referer)
+            resp.encoding = resp.apparent_encoding or "utf-8"
+            return resp.text
+        except CloudflareBlocked:
+            br = self._ensure_browser()
+            if br is None:
+                raise
+            return br.get_novel_html(url)
 
     def get_bytes(self, url: str, *, referer: Optional[str] = None) -> bytes:
-        # 图片域名对 requests 返回 403(JA3 指纹)，有浏览器时直接走浏览器多标签并行下载。
-        if self.browser:
-            return self.browser.get_image_bytes(url)
-        resp = self._requests_fetch(url, referer=referer, stream=True)
-        return resp.content
+        """图片：无浏览器直连（补全指纹头即可过 CDN 的 403）；失败再退浏览器。"""
+        try:
+            resp = self._requests_fetch(url, referer=referer, stream=True,
+                                        headers=_image_headers(referer))
+            return resp.content
+        except CloudflareBlocked:
+            br = self._ensure_browser()
+            if br is None:
+                raise
+            return br.get_image_bytes(url)
 
     def download_chapter(self, chapter_url, dest_dir, prefix, resume=True,
                          on_scanned=None, on_saved=None):
         """浏览器模式：一话内原生加载+缓存批量+XHR兜底下载到 dest_dir，返回已存 jpg 路径。"""
-        return self.browser.download_chapter(
+        br = self._ensure_browser()
+        if br is None:
+            raise BrowserUnavailable("该操作需要浏览器，但浏览器不可用。")
+        return br.download_chapter(
             chapter_url, dest_dir, prefix, resume=resume,
             on_scanned=on_scanned, on_saved=on_saved)
 
@@ -726,5 +797,6 @@ class Net:
             self.session.close()
         except Exception:
             pass
-        if self.browser:
-            self.browser.close()
+        if self._browser:
+            self._browser.close()
+            self._browser = None

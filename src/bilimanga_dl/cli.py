@@ -130,37 +130,66 @@ def _pause(msg: str = "按回车继续……") -> None:
         pass
 
 
-# ---------------- 会话状态 ----------------
-class _State:
+# ---------------- 跨下载复用的共享会话 ----------------
+class _Shared:
+    """跨多本下载复用的资源：Net（含惰性浏览器）与手机站轻小说引擎。
+
+    下完一本再下一本时不重建、不重新过验证——浏览器一旦启动就长期复用，
+    手机站会话/限流桶也沿用（限流冷却状态跨本保留，避免重复触发 429）。
+    """
+
     def __init__(self, config: Config):
         self.config = config
+        self._net: Optional[Net] = None
+        self._mobile = None            # MobileNovelDownloader（复用会话+限流）
+
+    def ensure_net(self) -> Net:
+        if self._net is None:
+            self._net = Net(self.config)
+        return self._net
+
+    def ensure_mobile(self):
+        if self._mobile is None:
+            from .novel_mobile import MobileNovelDownloader
+            self._mobile = MobileNovelDownloader(num_thread=4,
+                                                 proxy=self.config.proxy or "")
+        return self._mobile
+
+    def close(self) -> None:
+        if self._net is not None:
+            try:
+                self._net.close()
+            except Exception:  # noqa: BLE001
+                pass
+            self._net = None
+        if self._mobile is not None and hasattr(self._mobile, "close"):
+            try:
+                self._mobile.close()
+            except Exception:  # noqa: BLE001
+                pass
+            self._mobile = None
+
+
+# ---------------- 单本下载的流程状态 ----------------
+class _State:
+    def __init__(self, config: Config, shared: _Shared):
+        self.config = config
+        self.shared = shared
         self.is_novel: Optional[bool] = None
         self.book_no: str = ""
         self.book: Optional[Book] = None
         self.selected: List[int] = []
         self.fmt: str = "epub"
-        self.net: Optional[Net] = None            # 漫画/轻小说回退浏览器时用
         self.novel_engine = None                  # Mobile 或 NovelDownloader
         self.novel_via_browser = False
         self.exit_app = False                     # 用户在入口选“退出”
 
     def ensure_net(self) -> Net:
-        if self.net is None:
-            self.net = Net(self.config)
-        return self.net
+        return self.shared.ensure_net()
 
     def close(self) -> None:
-        if self.net is not None:
-            try:
-                self.net.close()
-            except Exception:  # noqa: BLE001
-                pass
-            self.net = None
-        if self.novel_engine is not None and hasattr(self.novel_engine, "close"):
-            try:
-                self.novel_engine.close()
-            except Exception:  # noqa: BLE001
-                pass
+        # 单本结束不关闭共享资源（跨本复用）；仅由外层在退出时统一关闭。
+        pass
 
 
 # ---------------- 输入归类（域名优先，避免书号跨站撞车）----------------
@@ -343,10 +372,9 @@ def _parse_book(st: _State) -> Optional[Book]:
 
 
 def _parse_novel(st: _State) -> Optional[Book]:
-    # 优先无浏览器手机站引擎
-    from .novel_mobile import MobileNovelDownloader
+    # 优先无浏览器手机站引擎（跨本复用同一会话/限流桶）
     try:
-        eng = MobileNovelDownloader(num_thread=4, proxy=st.config.proxy or "")
+        eng = st.shared.ensure_mobile()
         book = eng.fetch_book(st.book_no)
         if book.volumes:
             st.novel_engine = eng
@@ -502,13 +530,17 @@ def _run_flow(st: _State, start_at: int = 0) -> None:
 
 def run_download(config: Config, url_or_no: str) -> None:
     """命令行直接下载：按网址域名判类型（裸书号默认漫画），从“确认”步进入。"""
-    st = _State(config)
+    shared = _Shared(config)
+    st = _State(config, shared)
     try:
         st.is_novel, st.book_no = _classify_input(url_or_no, default_is_novel=False)
     except ValueError as exc:
         _print(f"[red]{exc}[/red]")
         return
-    _run_flow(st, start_at=1)   # 从“确认”开始
+    try:
+        _run_flow(st, start_at=1)   # 从“确认”开始
+    finally:
+        shared.close()
 
 
 # ---------------- 入口 ----------------
@@ -546,10 +578,15 @@ def main(argv: Optional[List[str]] = None) -> int:
         run_download(config, argv[0])
         return 0
 
-    # 无参数：循环进入步骤机（从入口开始，一本下完再回到入口）
-    while True:
-        st = _State(config)
-        _run_flow(st, start_at=0)
-        if st.exit_app:            # 用户在入口输入 q 退出
-            _print("再见！")
-            return 0
+    # 无参数：循环进入步骤机（从入口开始，一本下完再回到入口）。
+    # 共享会话跨本复用：下完一本再下别的，不重建会话、不重复过验证。
+    shared = _Shared(config)
+    try:
+        while True:
+            st = _State(config, shared)
+            _run_flow(st, start_at=0)
+            if st.exit_app:            # 用户在入口输入 q 退出
+                _print("再见！")
+                return 0
+    finally:
+        shared.close()
