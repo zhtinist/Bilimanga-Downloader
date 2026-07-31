@@ -608,8 +608,6 @@ class Net:
         self.session.headers.update({"User-Agent": MOBILE_UA, "Cookie": "night=0",
                                      "Accept-Language": "zh-CN,zh;q=0.9"})
         self.base_url: Optional[str] = None
-        self._lock = threading.Lock()
-        self._last_request_ts = 0.0
         self._proxy_disabled = False
         self._apply_proxy()
         # 共享节流器：命中 429 时全体线程一起冷却（跨卷/跨本复用同一个桶）。
