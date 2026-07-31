@@ -49,35 +49,62 @@ def is_mobile_novel_url(text: str) -> bool:
 
 
 class _RateGate:
-    """全局最小请求间隔 + 有限并发，主动限速避免触发反爬。"""
+    """全局请求节流：最小间隔 + 有限并发 + 共享冷却。
 
-    def __init__(self, min_interval: float, concurrency: int):
-        self._min = max(0.0, min_interval)
+    手机站会在短时突发（约 25 次）后返回 429，并需要一段冷却才恢复。命中限流时
+    调用 :meth:`penalize` 让**所有线程**一起停等一段冷却，并自适应拉长间隔，
+    避免每个请求各自疯狂重试把情况拖得更糟（那正是之前“卡住不动”的根因）。
+    """
+
+    def __init__(self, min_interval: float, concurrency: int,
+                 max_interval: float = 6.0):
+        self._base = max(0.0, min_interval)
+        self._min = self._base
+        self._max = max_interval
         self._sem = threading.Semaphore(max(1, concurrency))
         self._lock = threading.Lock()
         self._next = 0.0
+        self._cooldown_until = 0.0
 
     def acquire(self) -> None:
         self._sem.acquire()
-        with self._lock:
-            now = time.monotonic()
-            wait = self._next - now
-            if wait > 0:
-                time.sleep(wait)
+        while True:
+            with self._lock:
                 now = time.monotonic()
-            self._next = now + self._min
+                wait = max(self._next - now, self._cooldown_until - now)
+                if wait <= 0:
+                    self._next = now + self._min
+                    return
+            time.sleep(min(wait, 3.0))  # 分段睡，便于响应中断
 
     def release(self) -> None:
         self._sem.release()
+
+    def penalize(self, cooldown: float) -> None:
+        """命中限流：全体停等 ``cooldown`` 秒，并把稳态间隔调大一点。"""
+        with self._lock:
+            self._cooldown_until = max(self._cooldown_until,
+                                       time.monotonic() + cooldown)
+            self._min = min(self._min * 1.5 + 0.1, self._max)
+
+    def reward(self) -> None:
+        """连续成功：把间隔缓慢收回，恢复速度。"""
+        with self._lock:
+            if self._min > self._base:
+                self._min = max(self._base, self._min * 0.9)
 
 
 class MobileNovelDownloader:
     """无浏览器手机站引擎。接口对齐 :class:`novel.NovelDownloader`。"""
 
-    def __init__(self, num_thread: int = 4, min_interval: float = 0.2,
-                 concurrency: int = 4, timeout: int = 30, proxy: str = ""):
+    def __init__(self, num_thread: int = 4, min_interval: float = 0.7,
+                 concurrency: int = 1, timeout: int = 30, proxy: str = ""):
+        # 正文抓取默认**串行**（concurrency=1）：手机站对并发很敏感，多连接会被
+        # tarpit/429 拖到卡死。图片下载仍用 num_thread 并发（走 CDN，不受此限）。
         self.num_thread = max(1, num_thread)
         self.timeout = timeout
+        # (连接超时, 读超时)：避免被限流时单个请求长时间挂起。
+        self._to = (8, min(timeout, 20))
         self.session = requests.Session()
         self.session.headers.update({
             "User-Agent": MOBILE_UA,
@@ -90,30 +117,38 @@ class MobileNovelDownloader:
             self.session.proxies.update({"http": proxy, "https": proxy})
         self._gate = _RateGate(min_interval, concurrency)
 
-    # ---- 底层抓取（限速 + 退避重试）----
-    def _get(self, url: str, tries: int = 5) -> str:
+    # ---- 底层抓取（限速 + 429 冷却重试）----
+    def _get(self, url: str, tries: int = 8) -> str:
         last = ""
         for attempt in range(tries):
             self._gate.acquire()
             try:
-                r = self.session.get(url, timeout=self.timeout, allow_redirects=True)
+                r = self.session.get(url, timeout=self._to, allow_redirects=True)
                 text = r.text
+                status = r.status_code
             except requests.RequestException as exc:
                 last = str(exc)
                 text = ""
-                r = None
+                status = None
             finally:
                 self._gate.release()
-            if r is not None and r.status_code == 200 and not _blocked(text):
+            if status == 200 and not _blocked(text):
+                self._gate.reward()
                 return text
-            # 非 200 或占位/拦截页：指数退避后重试
-            backoff = min(1.5 * (2 ** attempt), 15)
-            log.warning("[mobile] 抓取失败(%s)，%.1fs 后重试(%d/%d): %s",
-                        (r.status_code if r is not None else last), backoff,
-                        attempt + 1, tries, url)
-            time.sleep(backoff)
+            # 429 / 占位页 / 网络错误：命中限流就让全体冷却，避免线程各自空转拖死。
+            rate_limited = (status == 429) or _blocked(text) or (status is None)
+            if rate_limited:
+                cooldown = min(15 + attempt * 8, 45)  # 站点突发后需要一段冷却
+                self._gate.penalize(cooldown)
+                log.warning("[mobile] 触发限流(%s)，全体冷却 %ds 后重试(%d/%d): %s",
+                            status or last, cooldown, attempt + 1, tries, url)
+            else:
+                backoff = min(1.5 * (2 ** attempt), 15)
+                log.warning("[mobile] 抓取失败(HTTP %s)，%.1fs 后重试(%d/%d): %s",
+                            status, backoff, attempt + 1, tries, url)
+                time.sleep(backoff)
         raise NovelRateLimited(
-            f"手机站多次抓取失败（可能限流/被拦）：{url}")
+            f"手机站多次抓取失败（限流未恢复）：{url}")
 
     # ---- 元数据 + 目录 ----
     def fetch_book(self, book_no: str) -> Book:
@@ -234,6 +269,9 @@ class MobileNovelDownloader:
         names = [ch.title for _, ch in jobs]
         bodies: dict = {}
         gated_flags: dict = {}
+        # 进度条按“章节数”推进（正文抓取是耗时大头），避免一直停在 0/None。
+        if on_total:
+            on_total(vidx, max(len(jobs), 1))
 
         def _fetch(job):
             i, ch = job
@@ -245,8 +283,11 @@ class MobileNovelDownloader:
                 log.warning("章节 %r 抓取失败：%s", ch.title, exc)
                 bodies[i] = ""
                 gated_flags[i] = True
+            if on_image:      # 每抓完一章推进一格
+                on_image(vidx)
 
-        with ThreadPoolExecutor(max_workers=self.num_thread) as pool:
+        # 正文抓取的并发由 _gate 控制（默认串行），这里线程数只是取任务方便。
+        with ThreadPoolExecutor(max_workers=max(self.num_thread, 1)) as pool:
             list(pool.map(_fetch, jobs))
 
         ordered = [bodies.get(i, "") for i, _ in jobs]
@@ -264,9 +305,9 @@ class MobileNovelDownloader:
                 on_phase(vidx, "empty")
             return None
 
-        # 插图（并发下载；readpai/站点图床不做防盗链，纯 requests 最快）
-        if on_total:
-            on_total(vidx, max(len(img_map), 1))
+        # 插图（并发下载；readpai/站点图床走 CDN，不做防盗链）
+        if on_phase:
+            on_phase(vidx, "images")
         images: dict = {}
         lock = threading.Lock()
 
@@ -274,7 +315,7 @@ class MobileNovelDownloader:
             url, idx = item
             data = None
             try:
-                r = self.session.get(url, timeout=self.timeout)
+                r = self.session.get(url, timeout=self._to)
                 if r.status_code == 200 and r.content:
                     data = r.content
             except requests.RequestException as exc:

@@ -385,8 +385,8 @@ def _run_novel_progress(engine, book: Book, volumes, target) -> List[Path]:
                     progress.advance(_t, 1)
 
                 def on_phase(vi, ph, _t=task, _v=v):
-                    label = {"download": "下载文本/插图", "package": "打包",
-                             "empty": "无内容"}.get(ph, ph)
+                    label = {"download": "⬇ 下载正文", "images": "🖼 下载插图",
+                             "package": "📦 打包", "empty": "无内容"}.get(ph, ph)
                     progress.update(_t, description=f"{label}  {_v.title}")
 
                 path = engine.download_volume(book, v, target, on_phase=on_phase,
