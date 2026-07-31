@@ -1,5 +1,7 @@
 # 跨平台依赖，pip install -r requirements.txt
 requests>=2.31.0
+# 用真实 Chrome 的 TLS/JA3 指纹过 Cloudflare 指纹级封锁（图片 CDN 等），无需浏览器
+curl_cffi>=0.7.0
 beautifulsoup4>=4.12.0
 lxml>=5.0.0
 rich>=13.0.0

@@ -22,7 +22,8 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Callable, List, Optional, Tuple
 
-import requests
+from curl_cffi import requests as cffi
+from curl_cffi.requests import exceptions as cffi_exc
 from bs4 import BeautifulSoup
 
 from .logutil import get_logger
@@ -34,8 +35,7 @@ from .ratelimit import RateGate as _RateGate
 log = get_logger("novel_mobile")
 
 DOMAIN = "https://www.bilinovel.com"
-MOBILE_UA = ("Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 "
-             "(KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36")
+IMPERSONATE = "chrome"  # curl_cffi 用真实 Chrome 指纹过 CF；bilinovel 手机站对任何 UA 都吐手机版 DOM
 # #acontent 里非正文的装饰/诱饵节点：整段丢弃，只留 <p> 与 <img>
 _DROP_TAGS = {"div", "ins", "figure", "fig", "script", "style", ".tp", ".bd"}
 # 限流/被拦占位页特征
@@ -60,16 +60,16 @@ class MobileNovelDownloader:
         self.timeout = timeout
         # (连接超时, 读超时)：避免被限流时单个请求长时间挂起。
         self._to = (8, min(timeout, 20))
-        self.session = requests.Session()
+        # curl_cffi 会话：真实 Chrome 指纹，长期复用（连接池 + cookie 跨请求保留）。
+        self.session = cffi.Session(impersonate=IMPERSONATE)
         self.session.headers.update({
-            "User-Agent": MOBILE_UA,
             "Accept": "*/*",
             "Accept-Language": "zh-CN,zh;q=0.9",
             "Cookie": "night=0",
             "Referer": DOMAIN,
         })
         if proxy:
-            self.session.proxies.update({"http": proxy, "https": proxy})
+            self.session.proxies = {"http": proxy, "https": proxy}
         self._gate = _RateGate(min_interval, concurrency)
 
     # ---- 底层抓取（限速 + 429 冷却重试）----
@@ -81,7 +81,7 @@ class MobileNovelDownloader:
                 r = self.session.get(url, timeout=self._to, allow_redirects=True)
                 text = r.text
                 status = r.status_code
-            except requests.RequestException as exc:
+            except cffi_exc.RequestException as exc:
                 last = str(exc)
                 text = ""
                 status = None
@@ -273,7 +273,7 @@ class MobileNovelDownloader:
                 r = self.session.get(url, timeout=self._to)
                 if r.status_code == 200 and r.content:
                     data = r.content
-            except requests.RequestException as exc:
+            except cffi_exc.RequestException as exc:
                 log.warning("插图 %s 下载失败：%s", idx, exc)
             if data is not None:
                 try:

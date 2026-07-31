@@ -28,7 +28,10 @@ from pathlib import Path
 from typing import Optional
 from urllib.parse import urlparse
 
-import requests
+# curl_cffi：以真实 Chrome 的 TLS/JA3 指纹发请求，能过 Cloudflare 对图片 CDN 等
+# 的指纹级封锁（普通 requests 即便补全请求头也会被 403）。API 与 requests 兼容。
+from curl_cffi import requests as cffi
+from curl_cffi.requests import exceptions as cffi_exc
 
 
 def ensure_local_no_proxy() -> None:
@@ -59,34 +62,13 @@ USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 )
-# 手机 UA：实测 bilimanga 手机站直连（目录/阅读页/图片 CDN）用它即可，无需浏览器。
-MOBILE_UA = (
-    "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36"
-)
-
-
-def _origin(url: str) -> str:
-    p = urlparse(url or "")
-    return f"{p.scheme}://{p.netloc}" if p.scheme else ""
+# 用 curl_cffi 的 Chrome 指纹后，图片 CDN 只需带 Referer 即可通过（无需再手工
+# 拼 Sec-Fetch/Origin 等一堆头，那套在 CDN 收紧指纹校验后已不再可靠）。
+IMPERSONATE = "chrome"
 
 
 def _image_headers(referer: Optional[str]) -> dict:
-    """图片 CDN 需要完整的浏览器指纹头，否则 Cloudflare 返回 403（非 JS 质询）。"""
-    h = {
-        "User-Agent": MOBILE_UA,
-        "Accept": "image/avif,image/webp,image/apng,*/*;q=0.8",
-        "Accept-Language": "zh-CN,zh;q=0.9",
-        "Sec-Fetch-Dest": "image",
-        "Sec-Fetch-Mode": "no-cors",
-        "Sec-Fetch-Site": "cross-site",
-    }
-    if referer:
-        h["Referer"] = referer
-        o = _origin(referer)
-        if o:
-            h["Origin"] = o
-    return h
+    return {"Referer": referer} if referer else {}
 
 # 软性质询特征（浏览器会自动解算）。只用 interstitial 独有的串，
 # 不用 challenge-platform / __cf_chl（这些是 Cloudflare 的 beacon，正常页也可能带，会误判）。
@@ -604,8 +586,9 @@ class Net:
     def __init__(self, config: Config):
         ensure_local_no_proxy()  # 本地 CDP/请求绕过代理，避免被系统代理劫持
         self.config = config
-        self.session = requests.Session()
-        self.session.headers.update({"User-Agent": MOBILE_UA, "Cookie": "night=0",
+        # curl_cffi 会话：真实 Chrome 指纹，长期复用（连接池 + cookie 跨请求保留）。
+        self.session = cffi.Session(impersonate=IMPERSONATE)
+        self.session.headers.update({"Cookie": "night=0",
                                      "Accept-Language": "zh-CN,zh;q=0.9"})
         self.base_url: Optional[str] = None
         self._proxy_disabled = False
@@ -653,10 +636,10 @@ class Net:
         self.session.trust_env = False
         self.session.proxies = {"http": None, "https": None}
 
-    # ---- requests 抓取（限速 + 429 冷却 + 重试/代理回退；CF 质询交上层用浏览器）----
+    # ---- 抓取（curl_cffi 直连 + 限速 + 429 冷却 + 重试/代理回退；CF 质询交浏览器）----
     def _requests_fetch(self, url: str, *, referer: Optional[str] = None,
-                        stream: bool = False, headers: Optional[dict] = None,
-                        timeout: Optional[float] = None) -> requests.Response:
+                        headers: Optional[dict] = None,
+                        timeout: Optional[float] = None):
         hdrs = dict(headers or {})
         if referer and "Referer" not in hdrs:
             hdrs["Referer"] = referer
@@ -668,9 +651,9 @@ class Net:
         while attempt < attempts:
             self._gate.acquire()
             try:
-                resp = self.session.get(url, headers=hdrs, timeout=to, stream=stream)
+                resp = self.session.get(url, headers=hdrs, timeout=to)
                 status = resp.status_code
-            except requests.exceptions.ProxyError as exc:
+            except cffi_exc.ProxyError as exc:
                 self._gate.release()
                 last_exc = exc
                 log.warning("代理连接失败 %s: %s", url, exc)
@@ -680,7 +663,7 @@ class Net:
                     continue
                 attempt += 1
                 continue
-            except requests.RequestException as exc:
+            except cffi_exc.RequestException as exc:
                 self._gate.release()
                 last_exc = exc
                 log.warning("请求异常 %s: %s", url, exc)
@@ -693,7 +676,7 @@ class Net:
                 if status == 200:
                     self._gate.reward()
                     return resp
-                last_exc = requests.HTTPError(f"HTTP {status}: {url}")
+                last_exc = cffi_exc.HTTPError(f"HTTP {status}: {url}")
                 # 429 / 占位限流：全体冷却后重试（不交给浏览器，纯粹是限速）。
                 if status == 429:
                     cooldown = min(15 + attempt * 8, 45)
@@ -701,9 +684,9 @@ class Net:
                     log.warning("触发限流(429)，全体冷却 %ds 后重试(%d/%d): %s",
                                 cooldown, attempt, attempts, url)
                     continue
-                # Cloudflare JS 质询：requests 过不了，交给上层用浏览器。
-                if _looks_like_cloudflare("" if stream else resp.text, status):
-                    raise CloudflareBlocked(f"requests 被 Cloudflare 拦截: {url}")
+                # Cloudflare JS 质询：curl_cffi 也过不了才交给浏览器。
+                if _looks_like_cloudflare(resp.text, status):
+                    raise CloudflareBlocked(f"直连被 Cloudflare 拦截: {url}")
             if self.config.retry_enabled and attempt < attempts:
                 backoff = self.config.retry_backoff_base * (2 ** (attempt - 1))
                 backoff += random.uniform(0, 0.5)
@@ -745,11 +728,9 @@ class Net:
 
     def get_text(self, url: str, *, referer: Optional[str] = None,
                  wait_for: Optional[str] = None) -> str:
-        """优先无浏览器直连；撞上 Cloudflare 质询才启动/复用浏览器过验证。"""
+        """优先直连（curl_cffi）；撞上 Cloudflare 质询才启动/复用浏览器过验证。"""
         try:
-            resp = self._requests_fetch(url, referer=referer)
-            resp.encoding = resp.apparent_encoding or "utf-8"
-            return resp.text
+            return self._requests_fetch(url, referer=referer).text
         except CloudflareBlocked:
             br = self._ensure_browser()
             if br is None:
@@ -757,11 +738,9 @@ class Net:
             return br.get_html(url, wait_for=wait_for)
 
     def get_novel_text(self, url: str, *, referer: Optional[str] = None) -> str:
-        """轻小说阅读页 HTML（无浏览器直连；撞 CF 才用浏览器做诱饵段落清理）。"""
+        """轻小说阅读页 HTML（直连；撞 CF 才用浏览器做诱饵段落清理）。"""
         try:
-            resp = self._requests_fetch(url, referer=referer)
-            resp.encoding = resp.apparent_encoding or "utf-8"
-            return resp.text
+            return self._requests_fetch(url, referer=referer).text
         except CloudflareBlocked:
             br = self._ensure_browser()
             if br is None:
@@ -769,9 +748,9 @@ class Net:
             return br.get_novel_html(url)
 
     def get_bytes(self, url: str, *, referer: Optional[str] = None) -> bytes:
-        """图片：无浏览器直连（补全指纹头即可过 CDN 的 403）；失败再退浏览器。"""
+        """图片：curl_cffi 直连（Chrome 指纹过 CDN 的指纹级封锁）；失败再退浏览器。"""
         try:
-            resp = self._requests_fetch(url, referer=referer, stream=True,
+            resp = self._requests_fetch(url, referer=referer,
                                         headers=_image_headers(referer))
             return resp.content
         except CloudflareBlocked:

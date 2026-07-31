@@ -29,7 +29,7 @@ ROOT = Path(__file__).resolve().parent
 SRC = ROOT / "src"                      # 源代码目录
 REQUIREMENTS = SRC / "requirements.txt"
 IMPORT_CHECK = [
-    "requests", "bs4", "lxml", "rich", "DrissionPage",
+    "requests", "curl_cffi", "bs4", "lxml", "rich", "DrissionPage",
     "ebooklib", "img2pdf", "PIL", "pillow_avif", "questionary",
 ]
 # 已在目标环境里(重入标记),直接跑主程序,避免无限套娃
