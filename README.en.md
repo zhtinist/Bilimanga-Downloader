@@ -7,7 +7,7 @@ Downloader for [bilimanga.net](https://www.bilimanga.net/) manga and [bilinovel]
 ## Requirements
 
 - **Python 3.9+**
-- For **manga**, a local **Chrome or Edge** is also required (to pass Cloudflare); light novels use a direct mobile-site connection and usually need no browser.
+- Both manga and novels **connect directly by default** (no browser) — fast and light on memory. Only when a site occasionally shows a Cloudflare human check does it **auto-launch your local Chrome / Edge** to clear it once, then reuse it. So having **Chrome or Edge** installed is recommended as a fallback, but usually unused.
 
 ## Quick start
 
