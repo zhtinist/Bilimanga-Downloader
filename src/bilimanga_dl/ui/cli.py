@@ -534,9 +534,12 @@ def main(argv: Optional[List[str]] = None) -> int:
     config = Config.load()
 
     debug_on = debug_requested(config.debug)
-    log_path = setup_logging(debug_on)
+    # 开调试时，额外在下载目录写一份 log.txt（持续更新），排查“卡住”最直观。
+    log_path = setup_logging(debug_on,
+                             extra_dir=config.output_path() if debug_on else None)
     if debug_on:
         _print(f"[调试] 日志已开启，写入：{log_path}")
+        _print(f"[调试] 下载目录 log.txt：{config.output_path() / 'log.txt'}")
 
     if "--help" in argv or "-h" in argv:
         _print_help()

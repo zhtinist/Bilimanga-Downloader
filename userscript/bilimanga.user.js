@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Bilimanga 漫画/轻小说下载器
 // @namespace    https://github.com/zhtinist/Bilimanga-Downloader
-// @version      3.0.1
+// @version      3.0.2
 // @description  在 bilimanga 漫画 / 哔哩轻小说(bilinovel) 页面里一键把整卷下载成 EPUB / PDF，可存本地或上传到你的百度网盘。
 // @author       HTZHU
 // @license      MIT
@@ -61,6 +61,89 @@
       t = setTimeout(() => rej(new Error((label || "操作") + "超时")), ms);
     });
     return Promise.race([promise, guard]).finally(() => clearTimeout(t));
+  }
+
+  // ===================== 调试日志 =====================
+  // 勾选调试后：让用户选 log.txt 落点，边下边把日志“持续写盘”。关键点——即便某个
+  // await 卡死，事件循环并没有停，setInterval 定时刷盘照常执行，能把日志记到卡住的
+  // 那一刻，便于定位是哪一章/哪张图/哪个请求卡住。不支持 File System Access 或用户
+  // 取消时，退回“结束时把缓冲整体下载成 log.txt”。
+  let DBG = false;
+  let logBuffer = [];
+  let logHandle = null;        // FileSystemFileHandle
+  let logDirty = false;
+  let logFlushing = false;
+  let logFlushTimer = null;
+  const t0log = Date.now();
+
+  function dlog() {
+    if (!DBG) return;
+    const args = Array.prototype.slice.call(arguments);
+    const dt = ((Date.now() - t0log) / 1000).toFixed(2);
+    const line = `[+${dt}s] ` + args.map(
+      (a) => (typeof a === "string" ? a : (() => { try { return JSON.stringify(a); } catch (e) { return String(a); } })())
+    ).join(" ");
+    logBuffer.push(line);
+    logDirty = true;
+    try { console.debug("[bmd]", line); } catch (e) {}
+  }
+
+  async function flushLog() {
+    if (logFlushing || !logDirty || !logHandle) return;
+    logFlushing = true;
+    logDirty = false;
+    try {
+      const w = await logHandle.createWritable();
+      await w.write(logBuffer.join("\n") + "\n");
+      await w.close();
+    } catch (e) {
+      logDirty = true;      // 写失败下轮重试
+    } finally {
+      logFlushing = false;
+    }
+  }
+
+  async function startDebugLog() {
+    logBuffer = [];
+    logDirty = false;
+    logHandle = null;
+    // showSaveFilePicker 必须在用户手势里同步发起（onStart 由点击触发，此处之前无 await）
+    if (typeof window.showSaveFilePicker === "function") {
+      try {
+        logHandle = await window.showSaveFilePicker({
+          suggestedName: "log.txt",
+          types: [{ description: "文本日志", accept: { "text/plain": [".txt"] } }],
+        });
+      } catch (e) { logHandle = null; }   // 用户取消 → 退回结束时下载
+    }
+    if (logFlushTimer) clearInterval(logFlushTimer);
+    logFlushTimer = setInterval(() => { flushLog(); }, 1500);
+    dlog("=== 调试日志开始 ===");
+    dlog("UA", navigator.userAgent);
+    dlog("持续写盘方式", logHandle ? "File System Access（实时写 log.txt）" : "内存缓冲（结束时下载 log.txt）");
+  }
+
+  async function stopDebugLog() {
+    dlog("=== 调试日志结束 ===");
+    logDirty = true;
+    await flushLog();
+    if (logFlushTimer) { clearInterval(logFlushTimer); logFlushTimer = null; }
+    if (!logHandle) {          // 没拿到文件句柄：把缓冲整体存成 log.txt 到下载目录
+      try { saveText(logBuffer.join("\n") + "\n", "log.txt"); } catch (e) {}
+    }
+  }
+
+  function saveText(text, filename) {
+    const blob = new Blob([text], { type: "text/plain;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+    if (typeof GM_download === "function") {
+      try {
+        GM_download({ url, name: filename, saveAs: false,
+          onerror: () => anchorDownload(url, filename),
+          ontimeout: () => anchorDownload(url, filename) });
+      } catch (e) { anchorDownload(url, filename); }
+    } else { anchorDownload(url, filename); }
+    setTimeout(() => URL.revokeObjectURL(url), 60000);
   }
 
   // 带超时的 fetch：卡住的请求会自动 abort，避免拖死并发池里的一个 worker。
@@ -200,6 +283,7 @@
   async function fetchText(url, tries = 8) {
     let lastErr = null;
     for (let attempt = 0; attempt < tries; attempt++) {
+      dlog("GET", url, "第" + (attempt + 1) + "/" + tries + "次");
       await gate.acquire();
       let status = 0, html = "";
       try {
@@ -208,25 +292,33 @@
         html = await resp.text();
       } catch (e) {
         lastErr = e;
+        dlog("  请求异常", url, e && e.message);
       } finally {
         gate.release();
       }
       if (status === 200) {
         if (CF_CHALLENGE.some((m) => html.includes(m))) {
+          dlog("  命中 Cloudflare 质询", url);
           throw new Error("页面被 Cloudflare 拦截，请在当前标签手动通过人机验证后重试。");
         }
         if (html && !isRateLimited(status, html)) {
           gate.reward();
+          dlog("  200 OK", url, "字节=" + html.length);
           return html;
         }
       }
       // 429 / 占位限流 / 空响应：全体冷却后重试；其它 HTTP 错误指数退避。
       if (isRateLimited(status, html) || !html) {
-        gate.penalize(Math.min(15 + attempt * 8, 45));
+        const cd = Math.min(15 + attempt * 8, 45);
+        gate.penalize(cd);
+        dlog("  限流/空响应", url, "status=" + status, "冷却" + cd + "s后重试");
       } else {
-        await sleep(Math.min(1500 * Math.pow(2, attempt), 10000));
+        const bk = Math.min(1500 * Math.pow(2, attempt), 10000);
+        dlog("  HTTP 错误", url, "status=" + status, "退避" + bk + "ms");
+        await sleep(bk);
       }
     }
+    dlog("  放弃（多次抓取失败）", url);
     throw lastErr || new Error(`多次抓取失败（限流未恢复）：${url}`);
   }
 
@@ -339,13 +431,17 @@
 
   async function fetchChapterTextNovel(chapUrl, base) {
     let text = "", url = chapUrl, page = 1;
-    while (true) {
+    // 安全上限：正常分页不会超过几页；给个硬上限，杜绝“翻页条件误判”导致的死循环。
+    const MAX_PAGES = 30;
+    while (page <= MAX_PAGES) {
+      dlog("  正文分页", "第" + page + "页", url);
       const html = await fetchText(url);
       text += pageTextNovel(html);
       const nxt = chapUrl.replace(".html", "_" + (page + 1) + ".html").slice(base.length);
       if (html.includes(nxt)) { page += 1; url = base + nxt; }
       else break;
     }
+    if (page > MAX_PAGES) dlog("  ⚠ 分页达到上限 " + MAX_PAGES + "，强制停止", chapUrl);
     return text;
   }
 
@@ -481,10 +577,18 @@
     const jobs = vol.chapters.map((c, i) => ({ c, i })).filter((j) => !j.c.url.includes("javascript"));
     const bodies = new Array(vol.chapters.length).fill("");
     let done = 0;
+    dlog("▶ 开始卷", vol.index, vol.title, "章数=" + jobs.length);
     // 正文串行抓取（并发受 gate 控制；正文页对并发敏感，串行 + 429 冷却最稳）。
     await runPool(jobs, 1, async ({ c, i }) => {
-      try { bodies[i] = await fetchChapterTextNovel(c.url, book.base); }
-      catch (e) { bodies[i] = ""; }
+      dlog("正文 第" + (done + 1) + "/" + jobs.length + "章 开始", c.title, c.url);
+      const ts = Date.now();
+      try {
+        bodies[i] = await fetchChapterTextNovel(c.url, book.base);
+        dlog("正文 章完成", c.title, "字节=" + bodies[i].length, "耗时" + ((Date.now() - ts) / 1000).toFixed(1) + "s");
+      } catch (e) {
+        bodies[i] = "";
+        dlog("正文 章失败", c.title, e && e.message);
+      }
       done += 1;
       prog.setRatio(done / (jobs.length * 1.3));
       prog.setState(`下载正文 ${done}/${jobs.length}`);
@@ -510,20 +614,35 @@
     }
 
     prog.setState(`下载插图 ${imgUrls.length} 张…`);
+    dlog("插图 共", imgUrls.length, "张");
     const images = {};
+    let imgDone = 0;
     await runPool(imgUrls, IMAGE_CONCURRENCY, async (u) => {
+      const idx = imgMap[u];
       // 边下边补：单张就地重试 3 次，命中限流先等全局冷却。每次取图套 40s 总超时，
       // 卡死的请求会被 abort 并重试，不拖死并发池。
       for (let attempt = 0; attempt < 3; attempt++) {
         await gate.waitCooldown();
-        try { images[imgMap[u]] = await withTimeout(fetchImageAsJpeg(u), 40000, "下载插图"); return; }
-        catch (e) { if (attempt < 2) await sleep(500 * (attempt + 1)); }
+        dlog("插图 取", idx, "第" + (attempt + 1) + "次", u);
+        try {
+          images[idx] = await withTimeout(fetchImageAsJpeg(u), 40000, "下载插图");
+          imgDone += 1;
+          dlog("插图 OK", idx, images[idx].width + "x" + images[idx].height, "(" + imgDone + "/" + imgUrls.length + ")");
+          return;
+        } catch (e) {
+          dlog("插图 失败", idx, "第" + (attempt + 1) + "次", e && e.message);
+          if (attempt < 2) await sleep(500 * (attempt + 1));
+        }
       }
+      dlog("插图 放弃", idx, u);
     });
 
     prog.setState("打包中…");
+    dlog("打包中…", "章=" + chapters.length, "图=" + Object.keys(images).length);
     const bytes = buildEpubNovel(book, vol, chapters, images);
+    dlog("打包完成", "字节=" + bytes.length, "去向=" + saveTarget);
     await dispatchSave(book, bytes, safeName(`${book.title} - ${vol.title}`) + ".epub", "epub", prog);
+    dlog("✔ 卷完成", vol.index, vol.title);
     prog.done();
   }
 
@@ -1145,6 +1264,7 @@
     if (pre.errno !== 0) throw new Error("precreate 失败 errno=" + pre.errno);
     const uploadid = pre.uploadid || "";
     let toUpload = Array.isArray(pre.block_list) ? pre.block_list : blockList.map((_, i) => i);
+    dlog("网盘 precreate OK", remotePath, "总块=" + nblocks, "待传=" + toUpload.length);
 
     for (let k = 0; k < toUpload.length; k++) {
       const seq = toUpload[k];
@@ -1154,8 +1274,9 @@
       const url = "https://c.pcs.baidu.com/rest/2.0/pcs/superfile2?method=upload&app_id=250528"
         + "&channel=chunlei&clienttype=0&web=1&path=" + encodeURIComponent(remotePath)
         + "&uploadid=" + encodeURIComponent(uploadid) + "&partseq=" + seq;
+      dlog("网盘 传块", seq, "(" + (k + 1) + "/" + toUpload.length + ")");
       const jr = JSON.parse((await gmReq({ method: "POST", url, data: fd })).responseText);
-      if (!jr.md5) throw new Error("分块 " + seq + " 上传失败");
+      if (!jr.md5) { dlog("网盘 传块失败", seq, jr); throw new Error("分块 " + seq + " 上传失败"); }
       prog.setRatio((k + 1) / toUpload.length);
       prog.setState(`上传网盘 ${k + 1}/${toUpload.length} 块`);
     }
@@ -1172,10 +1293,14 @@
   // 统一保存出口：按面板选择存本地或传网盘。
   async function dispatchSave(book, bytes, filename, ext, prog) {
     if (saveTarget === "baidu") {
+      const remote = baiduRemotePath(book, filename);
+      dlog("保存 → 百度网盘", remote, "字节=" + bytes.length);
       prog.setState("上传网盘…");
-      await baiduUpload(bytes, baiduRemotePath(book, filename), prog);
+      await baiduUpload(bytes, remote, prog);
+      dlog("保存 网盘完成", remote);
       prog.setState("已上传网盘 ☁");
     } else {
+      dlog("保存 → 本地", filename, "字节=" + bytes.length);
       saveFile(bytes, filename, ext);
     }
   }
@@ -1271,19 +1396,24 @@
       const tasks = [];
       chapterData.forEach((c, ci) => c.urls.forEach((u, ii) => tasks.push({ ci, ii, url: u })));
 
+      dlog("▶ 开始卷", vol.index, vol.title, "图片总数=" + total);
       let done = 0;
       const fetchOne = async (t) => {
         // 单张最多试 3 次（网络抖动/429 常是暂时性）；命中限流先等全局冷却。
         // 每次取图套 40s 总超时，卡死的请求会被放弃并重试，不拖死并发池。
         for (let attempt = 0; attempt < 3; attempt++) {
           await gate.waitCooldown();
+          dlog("图片 取", t.ci + ":" + t.ii, "第" + (attempt + 1) + "次", t.url);
           try {
             chapterData[t.ci].images[t.ii] = await withTimeout(fetchImageAsJpeg(t.url), 40000, "下载图片");
+            dlog("图片 OK", t.ci + ":" + t.ii);
             return;
           } catch (e) {
+            dlog("图片 失败", t.ci + ":" + t.ii, "第" + (attempt + 1) + "次", e && e.message);
             if (attempt < 2) await sleep(500 * (attempt + 1));
           }
         }
+        dlog("图片 放弃", t.ci + ":" + t.ii, t.url);
       };
       await runPool(tasks, IMAGE_CONCURRENCY, async (t) => {
         await fetchOne(t);
@@ -1295,6 +1425,7 @@
       // 补漏轮：仍缺失的再单线程重试一遍，尽量补齐（同命令行版的“最终补齐”）
       const missing = tasks.filter((t) => !chapterData[t.ci].images[t.ii]);
       if (missing.length) {
+        dlog("补漏", missing.length, "张");
         prog.setState(`补漏 ${missing.length} 张…`);
         for (const t of missing) await fetchOne(t);
       }
@@ -1321,7 +1452,9 @@
       // 打包字节已生成，解码图片可以立刻释放，降低多卷连下时的内存峰值
       chapters.length = 0;
       release();
+      dlog("打包完成", ext, "字节=" + bytes.length, "去向=" + saveTarget);
       await dispatchSave(book, bytes, safeName(`${book.title} - ${vol.title}`) + "." + ext, ext, prog);
+      dlog("✔ 卷完成", vol.index, vol.title);
       bytes = null;
       prog.done();
     } finally {
@@ -1404,6 +1537,11 @@
       <div class="bmd-row bmd-hidden" id="bmd-baidu-row">
         <span style="color:#888;white-space:nowrap">网盘根路径</span>
         <input type="text" id="bmd-baidu-base" placeholder="/bilidownloader" />
+      </div>
+      <div class="bmd-row">
+        <label title="记录每次请求/每章/每张图，卡住时也能定位；日志写到 log.txt">
+          <input type="checkbox" id="bmd-debug"> 🐞 调试日志（出问题时勾选，生成 log.txt）
+        </label>
       </div>
       <div id="bmd-hint"></div>
       <div id="bmd-progress"></div>
@@ -1550,7 +1688,13 @@
       if (!v.startsWith("/")) v = "/" + v;
       setBaiduBase(v);
     }
-    setHint("");
+    // 调试日志：必须在这里（用户点击手势内、任何 await 之前）发起文件选择框。
+    DBG = panel.querySelector("#bmd-debug").checked;
+    if (DBG) {
+      await startDebugLog();
+      dlog("书", currentBook.title, currentBook.kind, "选中卷", selected.join(","), "格式=" + fmt, "去向=" + saveTarget);
+    }
+    setHint(DBG ? (logHandle ? "调试中：日志实时写入你选的 log.txt" : "调试中：日志将在结束时下载为 log.txt") : "");
     panel.querySelector("#bmd-start").disabled = true;
     panel.querySelector("#bmd-progress").innerHTML = "";
 
@@ -1563,6 +1707,7 @@
           if (book.kind === "novel") await processVolumeNovel(book, vol, prog);
           else await processVolume(book, vol, fmt, prog);
         } catch (e) {
+          dlog("✖ 卷异常", vol.index, vol.title, e && e.message);
           prog.error("失败：" + e.message);
           if (String(e.message).includes("Cloudflare")) {
             setHint(e.message);
@@ -1572,6 +1717,7 @@
       }
     } finally {
       panel.querySelector("#bmd-start").disabled = false;
+      if (DBG) { await stopDebugLog(); DBG = false; }
     }
   }
 

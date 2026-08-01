@@ -33,8 +33,14 @@ def get_logger(module: Optional[str] = None) -> logging.Logger:
     return logging.getLogger(LOGGER_NAME)
 
 
-def setup_logging(enabled: bool, to_file: bool = True) -> Optional[Path]:
-    """配置日志。返回日志文件路径（未开启或不写文件时为 None）。"""
+def setup_logging(enabled: bool, to_file: bool = True,
+                  extra_dir: Optional[Path] = None) -> Optional[Path]:
+    """配置日志。返回日志文件路径（未开启或不写文件时为 None）。
+
+    ``extra_dir`` 若给定（一般是下载输出目录），再往该目录写一份持续更新的
+    ``log.txt``——排查“下载卡住”时，日志就在你下载文件旁边，且 logging 每条即时
+    落盘，卡住那一刻的记录也在。
+    """
     logger = logging.getLogger(LOGGER_NAME)
     logger.propagate = False  # 不冒泡到 Python 根 logger
     # 清掉旧 handler，避免重复配置时叠加
@@ -68,7 +74,21 @@ def setup_logging(enabled: bool, to_file: bool = True) -> Optional[Path]:
         except OSError:
             log_path = None
 
-    logger.debug("调试日志已开启，日志文件：%s", log_path)
+    # 额外在下载目录写 log.txt（覆盖式，每次运行重来一份，方便直接查看）
+    if extra_dir is not None:
+        try:
+            extra_dir = Path(extra_dir).expanduser()
+            extra_dir.mkdir(parents=True, exist_ok=True)
+            txt = extra_dir / "log.txt"
+            th = logging.FileHandler(txt, mode="w", encoding="utf-8")
+            th.setFormatter(fmt)
+            th.setLevel(logging.DEBUG)
+            logger.addHandler(th)
+        except OSError:
+            pass
+
+    logger.debug("调试日志已开启，日志文件：%s；下载目录 log.txt：%s",
+                 log_path, (extra_dir / "log.txt") if extra_dir else "—")
     return log_path
 
 
