@@ -24,10 +24,10 @@ from typing import Callable, List, Optional, Tuple
 from bs4 import BeautifulSoup
 from PIL import Image
 
-from .logutil import get_logger
+from .core.logutil import get_logger
 from .models import Book, Chapter, Volume
-from .net import Net
-from .rubbish_secret_map import rubbish_secret_map
+from .core.net import Net
+from .data.rubbish_secret_map import rubbish_secret_map
 
 log = get_logger("novel")
 

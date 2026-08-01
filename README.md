@@ -76,11 +76,18 @@ python3 start.py --debug                       # 开启调试日志
 
 ```
 Bilimanga-Downloader/
-├── start.py              # 入口（首次运行自动建 .venv 装依赖）
-├── run.command           # macOS 双击启动
-├── run.bat               # Windows 双击启动
-├── src/bilimanga_dl/     # 源码
-└── resource/             # 资源文件
+├── start.py                    # 入口（首次运行自动建 .venv 装依赖）
+├── run.command / run.bat       # macOS / Windows 双击启动
+├── userscript/                 # 🐵 油猴脚本版
+└── src/bilimanga_dl/
+    ├── app.py                  # 编排：加载插件 → 进入界面
+    ├── core/                   # 基础设施：网络/限流/日志/图片/插件注册表
+    ├── sources/                # 内容源插件（漫画 / 轻小说，新站点=加一个文件）
+    ├── packagers/              # 打包器插件（EPUB / PDF）
+    ├── storage/                # 存储去向插件（本地 / 百度网盘…）
+    └── ui/                     # 终端交互（步骤机、选章、设置）
 ```
+
+> 插件化：加新站点/新格式/新云盘 = 新增一个插件文件并注册，无需改动其它层。
 
 > 仅供个人学习与备份公开内容使用，请遵守站点条款。

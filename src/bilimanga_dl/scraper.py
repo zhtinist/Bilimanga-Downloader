@@ -21,9 +21,9 @@ from typing import List, Optional
 
 from bs4 import BeautifulSoup
 
-from .logutil import get_logger
+from .core.logutil import get_logger
 from .models import Book, Chapter, Volume
-from .net import Net
+from .core.net import Net
 
 log = get_logger("scraper")
 

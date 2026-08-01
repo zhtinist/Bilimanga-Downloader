@@ -27,11 +27,11 @@ from curl_cffi import requests as cffi
 from curl_cffi.requests import exceptions as cffi_exc
 from bs4 import BeautifulSoup
 
-from .logutil import get_logger
+from .core.logutil import get_logger
 from .models import Book, Chapter, Volume
 from .novel import (NovelRateLimited, NovelDownloader, _build_epub, _to_jpeg,
                     _text)
-from .ratelimit import RateGate as _RateGate
+from .core.ratelimit import RateGate as _RateGate
 
 log = get_logger("novel_mobile")
 

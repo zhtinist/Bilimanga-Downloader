@@ -12,9 +12,9 @@ from typing import List
 
 import img2pdf
 
-from .downloader import DownloadedVolume, safe_name
-from .logutil import get_logger
-from .models import Book
+from ..downloader import DownloadedVolume, safe_name
+from ..core.logutil import get_logger
+from ..models import Book
 
 log = get_logger("pdf")
 
@@ -41,3 +41,18 @@ def build_pdf(book: Book, dv: DownloadedVolume, out_dir: Path) -> Path:
     with open(out_path, "wb") as f:
         f.write(img2pdf.convert(image_paths, layout_fun=layout))
     return out_path
+
+
+# ---- 插件封装 ----
+from .base import Packager  # noqa: E402
+from ..core.registry import packagers  # noqa: E402
+
+
+@packagers.register
+class PdfPackager(Packager):
+    """PDF 打包器插件（漫画；每图整页）。"""
+    fmt = "pdf"
+    ext = ".pdf"
+
+    def build(self, book, dv, out_dir):
+        return build_pdf(book, dv, out_dir)

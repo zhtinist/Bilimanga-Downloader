@@ -26,10 +26,10 @@ from typing import Callable, List, Optional
 from PIL import Image
 
 from .config import Config
-from .imageutil import save_as_jpeg
-from .logutil import get_logger
+from .core.imageutil import save_as_jpeg
+from .core.logutil import get_logger
 from .models import Book, Volume
-from .net import Net
+from .core.net import Net
 from .scraper import Scraper
 
 log = get_logger("downloader")

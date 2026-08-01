@@ -13,10 +13,10 @@ from typing import List
 
 from ebooklib import epub
 
-from .downloader import DownloadedVolume, safe_name
-from .imageutil import image_size
-from .logutil import get_logger
-from .models import Book
+from ..downloader import DownloadedVolume, safe_name
+from ..core.imageutil import image_size
+from ..core.logutil import get_logger
+from ..models import Book
 
 log = get_logger("epub")
 
@@ -127,3 +127,18 @@ def build_epub(book: Book, dv: DownloadedVolume, out_dir: Path) -> Path:
     log.info("生成 EPUB: %s (%d 页图片)", out_path, img_counter)
     epub.write_epub(str(out_path), ebook)
     return out_path
+
+
+# ---- 插件封装 ----
+from .base import Packager  # noqa: E402
+from ..core.registry import packagers  # noqa: E402
+
+
+@packagers.register
+class EpubPackager(Packager):
+    """EPUB 打包器插件（漫画）。轻小说 EPUB 由轻小说源内部生成。"""
+    fmt = "epub"
+    ext = ".epub"
+
+    def build(self, book, dv, out_dir):
+        return build_epub(book, dv, out_dir)

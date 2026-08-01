@@ -102,6 +102,16 @@ class Config:
     # 调试日志：默认关闭；开启后输出到终端并写入 <root>/logs/
     debug: bool = False
 
+    # ---- 百度网盘（Cookie/BDUSS 方式；上传去向可选本地/网盘）----
+    # baidu_cookie 里保存登录态（BDUSS/STOKEN 等）——⚠️ 等于账号完整凭证，请勿外泄。
+    # 获取一次长期保存；每次启动会校验一次，失效则回到「未连接」。
+    baidu_cookie: str = ""
+    baidu_nickname: str = ""
+    # 上传根路径（网盘内），实际路径为 <base>/漫画|小说/<书名>/<文件>。
+    baidu_upload_base: str = "/bilidownloader"
+    # 下载去向：local（存本地）| baidu（传网盘）。未连接百度云时强制 local。
+    download_target: str = "local"
+
     # ---- 读写 ----
     @classmethod
     def load(cls) -> "Config":

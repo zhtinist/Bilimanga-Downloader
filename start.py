@@ -101,7 +101,7 @@ def main():
     if os.environ.get(READY_FLAG) == "1":
         if str(SRC) not in sys.path:
             sys.path.insert(0, str(SRC))
-        from bilimanga_dl.cli import main as cli_main
+        from bilimanga_dl.app import main as cli_main
         return cli_main(args)
 
     # 准备项目内 .venv

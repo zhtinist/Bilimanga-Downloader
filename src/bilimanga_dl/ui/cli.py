@@ -1,11 +1,11 @@
 """终端交互界面（唯一界面；无图形窗口）。
 
 设计：一个可前进/回退的**步骤机**，每步 ``console.clear()`` + 顶部面包屑，
-不再顺序刷屏。步骤：选类型 → 输链接 → 确认 → 选章 → 选格式 → 下载。
+不再顺序刷屏。步骤：输入网址 → 确认 → 选章 → 选格式 → 下载。
 
-- 漫画：bilimanga.net，真实浏览器过 Cloudflare（:class:`Net` + :class:`Scraper`）。
-- 轻小说：默认走**无浏览器手机站引擎**（:class:`MobileNovelDownloader`，快），
-  失败时自动回退浏览器引擎（:class:`NovelDownloader`）。
+本模块只负责**交互与进度展示**；解析/下载/打包/保存由插件完成——按输入选
+内容源（:mod:`sources`），按设置选存储去向（:mod:`storage`），格式选打包器
+（:mod:`packagers`），经 :class:`sources.base.Callbacks` 回传进度。
 """
 
 from __future__ import annotations
@@ -21,16 +21,18 @@ for _s in (sys.stdout, sys.stderr):
     except Exception:
         pass
 
-from .build_epub import build_epub
-from .build_pdf import build_pdf
-from .config import Config, TEMP_DOWNLOAD_DIR
-from .downloader import Downloader, cleanup_book_temp, safe_name
-from .logutil import debug_requested, get_logger, setup_logging
-from .models import Book
-from .net import Net
-from .scraper import Scraper, parse_book_no
-from .ui.picker import BACK, pick_volumes
-from .ui.settings import open_settings
+from ..config import Config, TEMP_DOWNLOAD_DIR
+from ..downloader import cleanup_book_temp
+from ..core.logutil import debug_requested, get_logger, setup_logging
+from ..models import Book
+from ..core.net import Net
+from ..scraper import parse_book_no
+from .picker import BACK, pick_volumes
+from .settings import open_settings
+from .. import sources as _sources_pkg  # noqa: F401 —— 触发内容源插件注册
+from .. import packagers as _packagers_pkg  # noqa: F401
+from .. import storage as _storage_pkg  # noqa: F401
+from ..core.registry import sources as _source_reg
 
 try:
     from rich.console import Console
@@ -141,33 +143,38 @@ class _Shared:
     def __init__(self, config: Config):
         self.config = config
         self._net: Optional[Net] = None
-        self._mobile = None            # MobileNovelDownloader（复用会话+限流）
+        self._sources: dict = {}       # kind -> Source 实例（会话/引擎跨本复用）
 
     def ensure_net(self) -> Net:
         if self._net is None:
             self._net = Net(self.config)
         return self._net
 
-    def ensure_mobile(self):
-        if self._mobile is None:
-            from .novel_mobile import MobileNovelDownloader
-            self._mobile = MobileNovelDownloader(num_thread=4,
-                                                 proxy=self.config.proxy or "")
-        return self._mobile
+    def source(self, is_novel: bool):
+        kind = "novel" if is_novel else "manga"
+        if kind not in self._sources:
+            cls = _source_reg.find(lambda c: getattr(c, "kind", None) == kind)
+            self._sources[kind] = cls(self.ensure_net(), self.config)
+        return self._sources[kind]
+
+    def storage(self):
+        """当前下载去向。2.0.0 只有本地；3.0.0 接入百度后按设置选择。"""
+        from ..storage.local import LocalStorage
+        return LocalStorage(self.config.output_path())
 
     def close(self) -> None:
+        for s in self._sources.values():
+            try:
+                s.close()
+            except Exception:  # noqa: BLE001
+                pass
+        self._sources.clear()
         if self._net is not None:
             try:
                 self._net.close()
             except Exception:  # noqa: BLE001
                 pass
             self._net = None
-        if self._mobile is not None and hasattr(self._mobile, "close"):
-            try:
-                self._mobile.close()
-            except Exception:  # noqa: BLE001
-                pass
-            self._mobile = None
 
 
 # ---------------- 单本下载的流程状态 ----------------
@@ -180,8 +187,7 @@ class _State:
         self.book: Optional[Book] = None
         self.selected: List[int] = []
         self.fmt: str = "epub"
-        self.novel_engine = None                  # Mobile 或 NovelDownloader
-        self.novel_via_browser = False
+        self.source = None                        # 当前内容源插件
         self.exit_app = False                     # 用户在入口选“退出”
 
     def ensure_net(self) -> Net:
@@ -201,7 +207,7 @@ def _classify_input(raw: str, default_is_novel: bool):
     只靠书号会撞车。裸书号无法从域名判断，返回的 ``is_novel`` 为
     ``default_is_novel``（交互模式传 None，由调用方追问类型）。
     """
-    from .novel import parse_novel_no
+    from ..novel import parse_novel_no
     s = (raw or "").strip()
     low = s.lower()
     is_url = ("://" in low) or ("." in low and "/" in low)
@@ -274,9 +280,14 @@ def _step_input(st: _State) -> str:
 def _step_confirm(st: _State) -> str:
     _clear()
     _breadcrumb(1, "轻小说" if st.is_novel else "漫画")
-    _print("正在解析……（轻小说秒开；漫画首次需启动浏览器过 Cloudflare，约 10–20 秒）")
-    book = _parse_book(st)
-    if book is None:
+    _print("正在解析……（轻小说秒开；漫画偶尔需启动浏览器过 Cloudflare，约 10–20 秒）")
+    st.source = st.shared.source(st.is_novel)
+    try:
+        book = st.source.fetch_book(st.book_no)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("解析失败：%s", exc)
+        book = None
+    if book is None or not book.volumes:
         _print("[red]解析失败。可能是书号错误 / 网络问题 / 站点结构变化。[/red]")
         _pause("按回车返回上一步……")
         return GO_BACK
@@ -328,19 +339,12 @@ def _step_format(st: _State) -> str:
 def _step_download(st: _State) -> str:
     _clear()
     _breadcrumb(4, "轻小说" if st.is_novel else "漫画")
-    out_root = st.config.output_path()
-    target = out_root / safe_name(st.book.title)
-    target.mkdir(parents=True, exist_ok=True)
-    _print(f"输出目录：[bold]{target}[/bold]\n")
-
+    storage = st.shared.storage()
+    _print(f"保存去向：[bold]{storage.status_label()}[/bold]\n")
     index_map = {v.index: v for v in st.book.volumes}
     volumes = [index_map[i] for i in st.selected if i in index_map]
-
     try:
-        if st.is_novel:
-            outputs = _run_novel_progress(st.novel_engine, st.book, volumes, target)
-        else:
-            outputs = _run_manga(st, volumes, target)
+        locations = _download_with_progress(st.source, st.book, volumes, st.fmt, storage)
     except KeyboardInterrupt:
         _print("\n[yellow]已中断，清理临时文件…[/yellow]")
         cleanup_book_temp(TEMP_DOWNLOAD_DIR, st.book.title)
@@ -351,151 +355,26 @@ def _step_download(st: _State) -> str:
         cleanup_book_temp(TEMP_DOWNLOAD_DIR, st.book.title)
         _pause("按回车返回主菜单……")
         return QUIT
-
-    _print(f"\n[bold green]✓ 全部完成，共 {len(outputs)} 个文件 → {target}[/bold green]")
+    _print(f"\n[bold green]✓ 全部完成，共 {len(locations)} 个文件（{storage.status_label()}）[/bold green]")
     _pause("\n按回车返回主菜单……")
     return QUIT
 
 
-# ---------------- 解析 / 下载实现 ----------------
-def _parse_book(st: _State) -> Optional[Book]:
-    if st.is_novel:
-        return _parse_novel(st)
-    net = st.ensure_net()
-    try:
-        detail = f"{st.config.site}/detail/{st.book_no}.html"
-        net.warm_up(detail)
-        return Scraper(net).fetch_book(st.book_no)
-    except Exception as exc:  # noqa: BLE001
-        log.warning("漫画解析失败：%s", exc)
-        return None
-
-
-def _parse_novel(st: _State) -> Optional[Book]:
-    # 优先无浏览器手机站引擎（跨本复用同一会话/限流桶）
-    try:
-        eng = st.shared.ensure_mobile()
-        book = eng.fetch_book(st.book_no)
-        if book.volumes:
-            st.novel_engine = eng
-            st.novel_via_browser = False
-            return book
-    except Exception as exc:  # noqa: BLE001
-        log.warning("手机站引擎解析失败，回退浏览器：%s", exc)
-    # 回退：浏览器引擎（桌面站 linovelib）
-    try:
-        from .novel import NovelDownloader
-        net = st.ensure_net()
-        eng = NovelDownloader(net)
-        book = eng.fetch_book(st.book_no)
-        st.novel_engine = eng
-        st.novel_via_browser = True
-        return book
-    except Exception as exc:  # noqa: BLE001
-        log.warning("浏览器引擎也失败：%s", exc)
-        return None
-
-
-def _run_novel_progress(engine, book: Book, volumes, target) -> List[Path]:
-    """轻小说下载进度。手机站引擎走三段流水线（run_pipeline，逐卷重叠）；
-    浏览器回退引擎无 run_pipeline，退回逐卷串行。"""
-    if hasattr(engine, "run_pipeline"):
-        return _run_novel_pipeline(engine, book, volumes, target)
-    outputs: List[Path] = []
-    for v in volumes:
-        print(f"⬇ 下载卷 {v.index}. {v.title}", flush=True)
-        try:
-            path = engine.download_volume(book, v, target)
-        except Exception as exc:  # noqa: BLE001
-            print(f"  ✗ {exc}", flush=True)
-            path = None
-        if path:
-            outputs.append(path)
-            print(f"  ✓ {path.name}", flush=True)
-        else:
-            print("  ⚠ 无内容", flush=True)
-    return outputs
-
-
-def _run_novel_pipeline(engine, book: Book, volumes, target) -> List[Path]:
-    """三段流水线进度（每卷一条，抓正文→下插图→打包，逐卷重叠）。"""
+# ---------------- 统一下载进度（漫画/轻小说共用，经内容源+存储）----------------
+def _download_with_progress(source, book: Book, volumes, fmt: str, storage) -> List[str]:
+    from ..sources.base import Callbacks
     titles = {v.index: v.title for v in volumes}
     if _console:
-        with Progress(SpinnerColumn(), TextColumn("[progress.description]{task.description}"),
+        with Progress(SpinnerColumn(),
+                      TextColumn("[progress.description]{task.description}"),
                       BarColumn(), TextColumn("{task.completed}/{task.total}"),
                       console=_console) as progress:
             tasks = {v.index: progress.add_task(f"⏳ 等待  {v.title}", total=None,
                                                 start=False) for v in volumes}
-
-            def on_start(vidx):
-                progress.start_task(tasks[vidx])
-                progress.update(tasks[vidx], description=f"⬇ 下载正文  {titles[vidx]}")
-
-            def on_total(vidx, n):
-                progress.update(tasks[vidx], total=max(n, 1))
-
-            def on_image(vidx):
-                progress.advance(tasks[vidx], 1)
-
-            def on_phase(vidx, ph):
-                label = {"images": "🖼 下载插图", "package": "📦 打包"}.get(ph)
-                if label:
-                    progress.update(tasks[vidx], description=f"{label}  {titles[vidx]}")
-
-            def on_done(vidx, path):
-                t = tasks[vidx]
-                total = progress.tasks[t].total or 1
-                if path:
-                    progress.update(t, completed=total,
-                                    description=f"[green]✓ {path.name}[/green]")
-                else:
-                    progress.update(t, completed=total,
-                                    description=f"[yellow]⚠ 无内容  {titles[vidx]}[/yellow]")
-
-            return engine.run_pipeline(book, volumes, target, on_start=on_start,
-                                       on_total=on_total, on_image=on_image,
-                                       on_phase=on_phase, on_done=on_done)
-    else:
-        def on_start(vidx):
-            print(f"⬇ 下载卷 {vidx}. {titles[vidx]}", flush=True)
-
-        def on_done(vidx, path):
-            print(f"  {'✓ ' + path.name if path else '⚠ 无内容'}", flush=True)
-
-        return engine.run_pipeline(book, volumes, target, on_start=on_start, on_done=on_done)
-
-
-def _run_manga(st: _State, volumes, target) -> List[Path]:
-    net = st.ensure_net()
-    downloader = Downloader(net, Scraper(net), st.config)
-    build_fn = build_epub if st.fmt == "epub" else build_pdf
-    try:
-        return _run_pipeline_with_progress(
-            downloader, st.book, volumes, TEMP_DOWNLOAD_DIR, target, build_fn)
-    finally:
-        # 正常结束兜底清空可能残留的空临时目录
-        book_temp = TEMP_DOWNLOAD_DIR / safe_name(st.book.title)
-        try:
-            if book_temp.exists() and not any(book_temp.iterdir()):
-                book_temp.rmdir()
-        except OSError:
-            pass
-
-
-def _run_pipeline_with_progress(downloader: Downloader, book: Book, volumes,
-                                temp_dir, out_dir, build_fn):
-    """漫画：每个选中卷一条进度条：下载→校对→打包→✓完成。"""
-    titles = {v.index: v.title for v in volumes}
-    if _console:
-        with Progress(SpinnerColumn(), TextColumn("[progress.description]{task.description}"),
-                      BarColumn(), TextColumn("{task.completed}/{task.total}"),
-                      console=_console) as progress:
-            tasks = {v.index: progress.add_task(f"⏳ 等待  {v.title}", total=None, start=False)
-                     for v in volumes}
-            conc_task = progress.add_task("🧵 并发线程：4", total=1, completed=0)
+            conc = progress.add_task("🧵 并发线程：-", total=1, completed=0)
 
             def on_concurrency(n):
-                progress.update(conc_task, description=f"🧵 并发线程：{n}")
+                progress.update(conc, description=f"🧵 并发线程：{n}")
 
             def on_start(vidx):
                 progress.start_task(tasks[vidx])
@@ -507,33 +386,35 @@ def _run_pipeline_with_progress(downloader: Downloader, book: Book, volumes,
             def on_image(vidx):
                 progress.advance(tasks[vidx], 1)
 
-            def on_phase(vidx, phase):
-                label = {"validate": "🔍 校对", "package": "📦 打包"}.get(phase, phase)
-                progress.update(tasks[vidx], description=f"{label}  {titles[vidx]}")
+            def on_phase(vidx, ph):
+                label = {"download": "⬇ 下载正文", "images": "🖼 下载插图",
+                         "validate": "🔍 校对", "package": "📦 打包"}.get(ph)
+                if label:
+                    progress.update(tasks[vidx], description=f"{label}  {titles[vidx]}")
 
             def on_done(vidx, path):
                 t = tasks[vidx]
                 total = progress.tasks[t].total or 1
                 if path:
                     progress.update(t, completed=total,
-                                    description=f"[green]✓ 完成  {path.name}[/green]")
+                                    description=f"[green]✓ 完成  {titles[vidx]}[/green]")
                 else:
                     progress.update(t, completed=total,
                                     description=f"[yellow]⚠ 无内容  {titles[vidx]}[/yellow]")
 
-            return downloader.run_pipeline(
-                book, volumes, temp_dir, out_dir, build_fn,
-                on_start=on_start, on_total=on_total, on_image=on_image,
-                on_phase=on_phase, on_done=on_done, on_concurrency=on_concurrency)
+            cb = Callbacks(on_start=on_start, on_total=on_total, on_image=on_image,
+                           on_phase=on_phase, on_done=on_done,
+                           on_concurrency=on_concurrency)
+            return source.download(book, volumes, fmt, storage, cb)
     else:
         def on_start(vidx):
-            print(f"⬇ 开始下载 卷{vidx}", flush=True)
+            print(f"⬇ 下载卷 {vidx}. {titles[vidx]}", flush=True)
 
         def on_done(vidx, path):
-            print(f"✓ 完成 卷{vidx}：{path.name if path else '无内容'}", flush=True)
+            print(f"  {'✓ 完成' if path else '⚠ 无内容'}", flush=True)
 
-        return downloader.run_pipeline(book, volumes, temp_dir, out_dir, build_fn,
-                                       on_start=on_start, on_done=on_done)
+        cb = Callbacks(on_start=on_start, on_done=on_done)
+        return source.download(book, volumes, fmt, storage, cb)
 
 
 # ---------------- 步骤机驱动 ----------------

@@ -18,7 +18,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
-from .config import LOG_DIR
+from ..config import LOG_DIR
 
 LOGGER_NAME = "bilimanga_dl"
 

@@ -50,7 +50,7 @@ def ensure_local_no_proxy() -> None:
                 parts.append(h)
         os.environ[key] = ",".join(parts)
 
-from .config import Config
+from ..config import Config
 from .imageutil import save_as_jpeg
 from .logutil import get_logger
 from .ratelimit import RateGate
@@ -248,7 +248,7 @@ class BrowserEngine:
         # 注意不能用 auto_port()——它会另配临时资料目录，且与 set_user_data_path 叠加会清掉端口。
         # 因此这里显式指定一个空闲端口 + 固定资料目录。
         try:
-            from .config import PROJECT_ROOT
+            from ..config import PROJECT_ROOT
             profile = PROJECT_ROOT / "browser_profile"
             profile.mkdir(parents=True, exist_ok=True)
             co.set_user_data_path(str(profile))
@@ -415,6 +415,26 @@ class BrowserEngine:
         """结束登录：关掉有头浏览器（Chrome 会把 cookie 落盘到资料目录），恢复无头。"""
         self.close()
         self._force_headful = False
+
+    def cookies(self) -> dict:
+        """读取当前浏览器的全部 cookie（含 httpOnly，跨域），返回 name->value。"""
+        try:
+            tab = self._borrow()
+        except Exception:  # noqa: BLE001
+            return {}
+        try:
+            out: dict = {}
+            for c in tab.cookies(all_domains=True):
+                name = c.get("name") if isinstance(c, dict) else getattr(c, "name", None)
+                val = c.get("value") if isinstance(c, dict) else getattr(c, "value", None)
+                if name:
+                    out[name] = val
+            return out
+        except Exception as exc:  # noqa: BLE001
+            log.debug("读取浏览器 cookie 失败: %s", exc)
+            return {}
+        finally:
+            self._release(tab)
 
     def prewarm(self, url: Optional[str] = None) -> None:
         """后台预热：启动浏览器 + 预先过一次 Cloudflare，隐藏冷启动耗时。"""
@@ -709,6 +729,10 @@ class Net:
     def finish_login(self) -> None:
         if self._browser:
             self._browser.finish_login()
+
+    def browser_cookies(self) -> dict:
+        """读取浏览器当前 cookie（name->value）；未启动浏览器则空。"""
+        return self._browser.cookies() if self._browser else {}
 
     def resolve_base_url(self) -> str:
         if self.base_url:
