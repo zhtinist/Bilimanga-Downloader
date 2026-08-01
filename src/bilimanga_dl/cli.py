@@ -397,41 +397,72 @@ def _parse_novel(st: _State) -> Optional[Book]:
 
 
 def _run_novel_progress(engine, book: Book, volumes, target) -> List[Path]:
-    """逐卷进度条（手机站引擎与浏览器引擎接口一致，共用此函数）。"""
+    """轻小说下载进度。手机站引擎走三段流水线（run_pipeline，逐卷重叠）；
+    浏览器回退引擎无 run_pipeline，退回逐卷串行。"""
+    if hasattr(engine, "run_pipeline"):
+        return _run_novel_pipeline(engine, book, volumes, target)
     outputs: List[Path] = []
+    for v in volumes:
+        print(f"⬇ 下载卷 {v.index}. {v.title}", flush=True)
+        try:
+            path = engine.download_volume(book, v, target)
+        except Exception as exc:  # noqa: BLE001
+            print(f"  ✗ {exc}", flush=True)
+            path = None
+        if path:
+            outputs.append(path)
+            print(f"  ✓ {path.name}", flush=True)
+        else:
+            print("  ⚠ 无内容", flush=True)
+    return outputs
+
+
+def _run_novel_pipeline(engine, book: Book, volumes, target) -> List[Path]:
+    """三段流水线进度（每卷一条，抓正文→下插图→打包，逐卷重叠）。"""
+    titles = {v.index: v.title for v in volumes}
     if _console:
         with Progress(SpinnerColumn(), TextColumn("[progress.description]{task.description}"),
                       BarColumn(), TextColumn("{task.completed}/{task.total}"),
                       console=_console) as progress:
-            for v in volumes:
-                task = progress.add_task(f"⬇ {v.title}", total=None)
+            tasks = {v.index: progress.add_task(f"⏳ 等待  {v.title}", total=None,
+                                                start=False) for v in volumes}
 
-                def on_total(vi, n, _t=task):
-                    progress.update(_t, total=max(n, 1))
+            def on_start(vidx):
+                progress.start_task(tasks[vidx])
+                progress.update(tasks[vidx], description=f"⬇ 下载正文  {titles[vidx]}")
 
-                def on_image(vi, _t=task):
-                    progress.advance(_t, 1)
+            def on_total(vidx, n):
+                progress.update(tasks[vidx], total=max(n, 1))
 
-                def on_phase(vi, ph, _t=task, _v=v):
-                    label = {"download": "⬇ 下载正文", "images": "🖼 下载插图",
-                             "package": "📦 打包", "empty": "无内容"}.get(ph, ph)
-                    progress.update(_t, description=f"{label}  {_v.title}")
+            def on_image(vidx):
+                progress.advance(tasks[vidx], 1)
 
-                path = engine.download_volume(book, v, target, on_phase=on_phase,
-                                              on_total=on_total, on_image=on_image)
+            def on_phase(vidx, ph):
+                label = {"images": "🖼 下载插图", "package": "📦 打包"}.get(ph)
+                if label:
+                    progress.update(tasks[vidx], description=f"{label}  {titles[vidx]}")
+
+            def on_done(vidx, path):
+                t = tasks[vidx]
+                total = progress.tasks[t].total or 1
                 if path:
-                    outputs.append(path)
-                    progress.update(task, description=f"[green]✓ {path.name}[/green]")
+                    progress.update(t, completed=total,
+                                    description=f"[green]✓ {path.name}[/green]")
                 else:
-                    progress.update(task, description=f"[yellow]⚠ 无内容 {v.title}[/yellow]")
+                    progress.update(t, completed=total,
+                                    description=f"[yellow]⚠ 无内容  {titles[vidx]}[/yellow]")
+
+            return engine.run_pipeline(book, volumes, target, on_start=on_start,
+                                       on_total=on_total, on_image=on_image,
+                                       on_phase=on_phase, on_done=on_done)
     else:
-        for v in volumes:
-            print(f"⬇ 下载卷 {v.index}. {v.title}", flush=True)
-            path = engine.download_volume(book, v, target)
+        def on_start(vidx):
+            print(f"⬇ 下载卷 {vidx}. {titles[vidx]}", flush=True)
+
+        def on_done(vidx, path):
             print(f"  {'✓ ' + path.name if path else '⚠ 无内容'}", flush=True)
-            if path:
-                outputs.append(path)
-    return outputs
+
+        return engine.run_pipeline(book, volumes, target, on_start=on_start, on_done=on_done)
 
 
 def _run_manga(st: _State, volumes, target) -> List[Path]:

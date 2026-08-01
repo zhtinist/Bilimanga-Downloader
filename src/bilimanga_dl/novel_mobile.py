@@ -249,6 +249,63 @@ class MobileNovelDownloader:
             on_phase(vidx, "package")
         return _build_epub(book, volume, content.chapters, images, out_dir)
 
+    # ---- 逐卷流水线（三 agent 重叠，接口对齐漫画 Downloader.run_pipeline）----
+    def run_pipeline(self, book: Book, volumes, out_dir: Path,
+                     on_start: Optional[Callable] = None,
+                     on_total: Optional[Callable] = None,
+                     on_image: Optional[Callable] = None,
+                     on_phase: Optional[Callable] = None,
+                     on_done: Optional[Callable] = None) -> List[Path]:
+        """三阶段重叠：Agent1 串行抓正文（受限流器约束，不能并行）；抓完立刻交
+        后台池做 Agent2 下插图（异源 CDN）+ Agent3 打包/校对，与下一卷抓正文重叠。
+
+        正文抓取是耗时大头且受站点按 IP 限流，必须串行；把下图+打包挪到后台，
+        隐藏这部分时间。回调参数首位均为卷号 vidx，与漫画版一致。
+        """
+        outputs: List[Path] = []
+        out_lock = threading.Lock()
+        finish_pool = ThreadPoolExecutor(max_workers=2)  # Agent2+3：下图/打包
+        futures = []
+
+        def _finish(vidx, volume, content):
+            # Agent2：下插图（异源 CDN，与下一卷抓正文并行）
+            if on_phase:
+                on_phase(vidx, "images")
+            images = self._download_images(content.img_map, vidx, None)
+            # Agent3：打包（简单校对：空正文章节由 _build_epub 自然跳过）
+            if on_phase:
+                on_phase(vidx, "package")
+            path = _build_epub(book, volume, content.chapters, images, out_dir)
+            with out_lock:
+                outputs.append(path)
+            if on_done:
+                on_done(vidx, path)
+            return path
+
+        try:
+            # Agent1：逐卷串行抓正文
+            for v in volumes:
+                if on_start:
+                    on_start(v.index)
+                if on_phase:
+                    on_phase(v.index, "download")
+                content = self._fetch_bodies(v, on_total, on_image)
+                if not content.has_text and len(content.img_map) <= 1:
+                    if on_phase:
+                        on_phase(v.index, "empty")
+                    if on_done:
+                        on_done(v.index, None)
+                    continue
+                futures.append(finish_pool.submit(_finish, v.index, v, content))
+            for f in futures:
+                try:
+                    f.result()
+                except Exception as exc:  # noqa: BLE001
+                    log.warning("卷打包失败：%s", exc)
+            return outputs
+        finally:
+            finish_pool.shutdown(wait=True)
+
     # ---- 阶段 1：抓正文（并发受 _gate 控制，默认串行以尊重限流）----
     def _fetch_bodies(self, volume: Volume,
                       on_total: Optional[Callable],
