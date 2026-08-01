@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Bilimanga 漫画/轻小说下载器
 // @namespace    https://github.com/zhtinist/Bilimanga-Downloader
-// @version      3.0.0
+// @version      3.0.1
 // @description  在 bilimanga 漫画 / 哔哩轻小说(bilinovel) 页面里一键把整卷下载成 EPUB / PDF，可存本地或上传到你的百度网盘。
 // @author       HTZHU
 // @license      MIT
@@ -51,6 +51,16 @@
 
   function sleep(ms) {
     return new Promise((r) => setTimeout(r, ms));
+  }
+
+  // 给任意 Promise 套一个总超时兜底：无论卡在网络、图片解码还是 canvas 编码，
+  // 到点就 reject，保证并发池的 worker 一定会往下走，绝不永久卡住。
+  function withTimeout(promise, ms, label) {
+    let t;
+    const guard = new Promise((_, rej) => {
+      t = setTimeout(() => rej(new Error((label || "操作") + "超时")), ms);
+    });
+    return Promise.race([promise, guard]).finally(() => clearTimeout(t));
   }
 
   // 带超时的 fetch：卡住的请求会自动 abort，避免拖死并发池里的一个 worker。
@@ -502,10 +512,11 @@
     prog.setState(`下载插图 ${imgUrls.length} 张…`);
     const images = {};
     await runPool(imgUrls, IMAGE_CONCURRENCY, async (u) => {
-      // 边下边补：单张就地重试 3 次，命中限流先等全局冷却。
+      // 边下边补：单张就地重试 3 次，命中限流先等全局冷却。每次取图套 40s 总超时，
+      // 卡死的请求会被 abort 并重试，不拖死并发池。
       for (let attempt = 0; attempt < 3; attempt++) {
         await gate.waitCooldown();
-        try { images[imgMap[u]] = await fetchImageAsJpeg(u); return; }
+        try { images[imgMap[u]] = await withTimeout(fetchImageAsJpeg(u), 40000, "下载插图"); return; }
         catch (e) { if (attempt < 2) await sleep(500 * (attempt + 1)); }
       }
     });
@@ -583,6 +594,10 @@
         url,
         responseType: "arraybuffer",
         anonymous: false,
+        // 关键：必须设超时。否则图床 hold 住连接不返回时，本请求永不结算，
+        // 会把并发池的 worker 一个个占死，最终进度条卡在半路不动（尤其轻小说插图
+        // 来自跨域图床、每张都走这里）。超时后 ontimeout 触发 → 交由上层重试/放弃。
+        timeout: 30000,
         // 图床常有防盗链：显式带上本站 Referer（同 Python 里“导航到图片同源再取字节”的效果）
         headers: { Referer: location.origin + "/" },
         onload: (resp) => {
@@ -1259,10 +1274,11 @@
       let done = 0;
       const fetchOne = async (t) => {
         // 单张最多试 3 次（网络抖动/429 常是暂时性）；命中限流先等全局冷却。
+        // 每次取图套 40s 总超时，卡死的请求会被放弃并重试，不拖死并发池。
         for (let attempt = 0; attempt < 3; attempt++) {
           await gate.waitCooldown();
           try {
-            chapterData[t.ci].images[t.ii] = await fetchImageAsJpeg(t.url);
+            chapterData[t.ci].images[t.ii] = await withTimeout(fetchImageAsJpeg(t.url), 40000, "下载图片");
             return;
           } catch (e) {
             if (attempt < 2) await sleep(500 * (attempt + 1));
