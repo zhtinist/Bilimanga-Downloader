@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Bilimanga 漫画/轻小说下载器
 // @namespace    https://github.com/zhtinist/Bilimanga-Downloader
-// @version      2.1.1
-// @description  在 bilimanga 漫画 / 哔哩轻小说(bilinovel) 页面里一键把整卷下载成 EPUB / PDF。
+// @version      3.0.0
+// @description  在 bilimanga 漫画 / 哔哩轻小说(bilinovel) 页面里一键把整卷下载成 EPUB / PDF，可存本地或上传到你的百度网盘。
 // @author       HTZHU
 // @license      MIT
 // @homepageURL  https://github.com/zhtinist/Bilimanga-Downloader
@@ -16,14 +16,19 @@
 // @grant        GM_download
 // @grant        GM_xmlhttpRequest
 // @grant        GM_addStyle
-// 明确声明图片 CDN 与站点域名：安装时一次性授权、之后下载不再逐次弹跨域验证。
-// （Tampermonkey 会匹配子域，故 motiezw.com 覆盖 i.motiezw.com、readpai.com 覆盖 img3.readpai.com）
+// @grant        GM_getValue
+// @grant        GM_setValue
+// 明确声明图片 CDN、站点域名与百度网盘域名：安装时一次性授权、之后下载/上传不再逐次弹跨域验证。
+// （Tampermonkey 会匹配子域，故 motiezw.com 覆盖 i.motiezw.com、readpai.com 覆盖 img3.readpai.com；
+//   baidu.com 覆盖 pan.baidu.com、pcs.baidu.com 覆盖 c.pcs.baidu.com——网盘用你浏览器里已登录的 cookie）
 // @connect      motiezw.com
 // @connect      readpai.com
 // @connect      bilimanga.net
 // @connect      bilicomic.net
 // @connect      bilinovel.com
 // @connect      linovelib.com
+// @connect      baidu.com
+// @connect      pcs.baidu.com
 // @run-at       document-idle
 // @updateURL    https://raw.githubusercontent.com/zhtinist/Bilimanga-Downloader/main/userscript/bilimanga.user.js
 // @downloadURL  https://raw.githubusercontent.com/zhtinist/Bilimanga-Downloader/main/userscript/bilimanga.user.js
@@ -507,7 +512,7 @@
 
     prog.setState("打包中…");
     const bytes = buildEpubNovel(book, vol, chapters, images);
-    saveFile(bytes, safeName(`${book.title} - ${vol.title}`) + ".epub", "epub");
+    await dispatchSave(book, bytes, safeName(`${book.title} - ${vol.title}`) + ".epub", "epub", prog);
     prog.done();
   }
 
@@ -988,6 +993,179 @@
   }
 
   // =====================================================================
+  // 六・五、百度网盘上传（用你浏览器里已登录的百度 cookie，走非官方网页/PCS 接口）
+  //   分片上传需按 4MB 块算 md5，而浏览器 crypto.subtle 不支持 md5，故内置 md5。
+  //   ⚠️ 非官方接口、违反百度网盘服务条款，百度改版/风控可能随时失效；仅供把自己
+  //   下载的内容备份到自己的网盘。
+  // =====================================================================
+  const BAIDU_BLOCK = 4 * 1024 * 1024;
+  const BAIDU_BASE_KEY = "bmd_baidu_base";
+  let saveTarget = "local";        // local | baidu，由面板选择
+
+  function baiduBase() {
+    try {
+      return typeof GM_getValue === "function"
+        ? GM_getValue(BAIDU_BASE_KEY, "/bilidownloader") : "/bilidownloader";
+    } catch (e) { return "/bilidownloader"; }
+  }
+  function setBaiduBase(v) {
+    try { if (typeof GM_setValue === "function") GM_setValue(BAIDU_BASE_KEY, v); } catch (e) {}
+  }
+  function baiduRemotePath(book, filename) {
+    const cat = book.kind === "novel" ? "小说" : "漫画";
+    let base = (baiduBase() || "/bilidownloader").replace(/\/+$/, "");
+    if (!base.startsWith("/")) base = "/" + base;
+    return `${base}/${cat}/${safeName(book.title)}/${filename}`;
+  }
+
+  function gmReq(opts) {
+    return new Promise((resolve, reject) => {
+      GM_xmlhttpRequest(Object.assign({
+        timeout: 180000,
+        onload: (r) => resolve(r),
+        onerror: () => reject(new Error("网络请求失败")),
+        ontimeout: () => reject(new Error("请求超时")),
+      }, opts));
+    });
+  }
+  function formBody(obj) {
+    return Object.keys(obj)
+      .map((k) => encodeURIComponent(k) + "=" + encodeURIComponent(obj[k])).join("&");
+  }
+
+  // 校验百度登录态并取昵称 + bdstoken；未登录/失败返回 null。
+  async function baiduVerify() {
+    try {
+      const url = "https://pan.baidu.com/api/gettemplatevariable?clienttype=0&app_id=250528&fields="
+        + encodeURIComponent('["username","bdstoken"]');
+      const r = JSON.parse((await gmReq({ method: "GET", url })).responseText);
+      if (r.errno === 0 && r.result) {
+        return { nickname: r.result.username || "百度用户", bdstoken: r.result.bdstoken };
+      }
+    } catch (e) {}
+    return null;
+  }
+
+  // 内置 md5：输入 Uint8Array，输出小写 hex（已与 python hashlib 对拍一致）。
+  function md5bytes(bytes) {
+    function add32(a, b) { return (a + b) & 0xffffffff; }
+    function cmn(q, a, b, x, s, t) {
+      a = add32(add32(a, q), add32(x, t));
+      return add32((a << s) | (a >>> (32 - s)), b);
+    }
+    function ff(a,b,c,d,x,s,t){ return cmn((b & c) | (~b & d), a, b, x, s, t); }
+    function gg(a,b,c,d,x,s,t){ return cmn((b & d) | (c & ~d), a, b, x, s, t); }
+    function hh(a,b,c,d,x,s,t){ return cmn(b ^ c ^ d, a, b, x, s, t); }
+    function ii(a,b,c,d,x,s,t){ return cmn(c ^ (b | ~d), a, b, x, s, t); }
+    function blk(bb, off) {
+      const m = [];
+      for (let i = 0; i < 16; i++) {
+        m[i] = bb[off+i*4] + (bb[off+i*4+1]<<8) + (bb[off+i*4+2]<<16) + (bb[off+i*4+3]<<24);
+      }
+      return m;
+    }
+    function cycle(x, k) {
+      let a=x[0], b=x[1], c=x[2], d=x[3];
+      a=ff(a,b,c,d,k[0],7,-680876936); d=ff(d,a,b,c,k[1],12,-389564586); c=ff(c,d,a,b,k[2],17,606105819); b=ff(b,c,d,a,k[3],22,-1044525330);
+      a=ff(a,b,c,d,k[4],7,-176418897); d=ff(d,a,b,c,k[5],12,1200080426); c=ff(c,d,a,b,k[6],17,-1473231341); b=ff(b,c,d,a,k[7],22,-45705983);
+      a=ff(a,b,c,d,k[8],7,1770035416); d=ff(d,a,b,c,k[9],12,-1958414417); c=ff(c,d,a,b,k[10],17,-42063); b=ff(b,c,d,a,k[11],22,-1990404162);
+      a=ff(a,b,c,d,k[12],7,1804603682); d=ff(d,a,b,c,k[13],12,-40341101); c=ff(c,d,a,b,k[14],17,-1502002290); b=ff(b,c,d,a,k[15],22,1236535329);
+      a=gg(a,b,c,d,k[1],5,-165796510); d=gg(d,a,b,c,k[6],9,-1069501632); c=gg(c,d,a,b,k[11],14,643717713); b=gg(b,c,d,a,k[0],20,-373897302);
+      a=gg(a,b,c,d,k[5],5,-701558691); d=gg(d,a,b,c,k[10],9,38016083); c=gg(c,d,a,b,k[15],14,-660478335); b=gg(b,c,d,a,k[4],20,-405537848);
+      a=gg(a,b,c,d,k[9],5,568446438); d=gg(d,a,b,c,k[14],9,-1019803690); c=gg(c,d,a,b,k[3],14,-187363961); b=gg(b,c,d,a,k[8],20,1163531501);
+      a=gg(a,b,c,d,k[13],5,-1444681467); d=gg(d,a,b,c,k[2],9,-51403784); c=gg(c,d,a,b,k[7],14,1735328473); b=gg(b,c,d,a,k[12],20,-1926607734);
+      a=hh(a,b,c,d,k[5],4,-378558); d=hh(d,a,b,c,k[8],11,-2022574463); c=hh(c,d,a,b,k[11],16,1839030562); b=hh(b,c,d,a,k[14],23,-35309556);
+      a=hh(a,b,c,d,k[1],4,-1530992060); d=hh(d,a,b,c,k[4],11,1272893353); c=hh(c,d,a,b,k[7],16,-155497632); b=hh(b,c,d,a,k[10],23,-1094730640);
+      a=hh(a,b,c,d,k[13],4,681279174); d=hh(d,a,b,c,k[0],11,-358537222); c=hh(c,d,a,b,k[3],16,-722521979); b=hh(b,c,d,a,k[6],23,76029189);
+      a=hh(a,b,c,d,k[9],4,-640364487); d=hh(d,a,b,c,k[12],11,-421815835); c=hh(c,d,a,b,k[15],16,530742520); b=hh(b,c,d,a,k[2],23,-995338651);
+      a=ii(a,b,c,d,k[0],6,-198630844); d=ii(d,a,b,c,k[7],10,1126891415); c=ii(c,d,a,b,k[14],15,-1416354905); b=ii(b,c,d,a,k[5],21,-57434055);
+      a=ii(a,b,c,d,k[12],6,1700485571); d=ii(d,a,b,c,k[3],10,-1894986606); c=ii(c,d,a,b,k[10],15,-1051523); b=ii(b,c,d,a,k[1],21,-2054922799);
+      a=ii(a,b,c,d,k[8],6,1873313359); d=ii(d,a,b,c,k[15],10,-30611744); c=ii(c,d,a,b,k[6],15,-1560198380); b=ii(b,c,d,a,k[13],21,1309151649);
+      a=ii(a,b,c,d,k[4],6,-145523070); d=ii(d,a,b,c,k[11],10,-1120210379); c=ii(c,d,a,b,k[2],15,718787259); b=ii(b,c,d,a,k[9],21,-343485551);
+      x[0]=add32(a,x[0]); x[1]=add32(b,x[1]); x[2]=add32(c,x[2]); x[3]=add32(d,x[3]);
+    }
+    const n = bytes.length;
+    const state = [1732584193, -271733879, -1732584194, 271733878];
+    let i;
+    for (i = 64; i <= n; i += 64) cycle(state, blk(bytes, i - 64));
+    const rem = n % 64;
+    const tail = new Uint8Array(rem < 56 ? 64 : 128);
+    for (let j = 0; j < rem; j++) tail[j] = bytes[n - rem + j];
+    tail[rem] = 0x80;
+    const bits = n * 8;
+    const lp = tail.length - 8;
+    tail[lp] = bits & 0xff; tail[lp+1] = (bits>>>8)&0xff; tail[lp+2] = (bits>>>16)&0xff; tail[lp+3] = (bits>>>24)&0xff;
+    const hi = Math.floor(n / 0x20000000);
+    tail[lp+4] = hi & 0xff; tail[lp+5] = (hi>>>8)&0xff; tail[lp+6] = (hi>>>16)&0xff; tail[lp+7] = (hi>>>24)&0xff;
+    for (i = 0; i < tail.length; i += 64) cycle(state, blk(tail, i));
+    const hex = "0123456789abcdef";
+    let out = "";
+    for (let j = 0; j < 4; j++) {
+      const v = state[j];
+      for (let k = 0; k < 4; k++) {
+        const byte = (v >>> (k * 8)) & 0xff;
+        out += hex[(byte >> 4) & 0xf] + hex[byte & 0xf];
+      }
+    }
+    return out;
+  }
+
+  // 分片上传成品到网盘 remotePath（precreate→superfile2 逐块→create 合并）。
+  async function baiduUpload(bytes, remotePath, prog) {
+    const info = await baiduVerify();
+    if (!info) throw new Error("百度网盘未登录：请先在浏览器登录 pan.baidu.com 再上传");
+    const size = bytes.length;
+    const nblocks = Math.max(1, Math.ceil(size / BAIDU_BLOCK));
+    const blockList = [];
+    for (let i = 0; i < nblocks; i++) {
+      blockList.push(md5bytes(bytes.subarray(i * BAIDU_BLOCK, Math.min(size, (i + 1) * BAIDU_BLOCK))));
+    }
+    const common = "channel=chunlei&web=1&app_id=250528&clienttype=0&bdstoken=" + encodeURIComponent(info.bdstoken);
+
+    const pre = JSON.parse((await gmReq({
+      method: "POST", url: "https://pan.baidu.com/api/precreate?" + common,
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      data: formBody({ path: remotePath, size, isdir: 0, autoinit: 1, rtype: 3, block_list: JSON.stringify(blockList) }),
+    })).responseText);
+    if (pre.errno !== 0) throw new Error("precreate 失败 errno=" + pre.errno);
+    const uploadid = pre.uploadid || "";
+    let toUpload = Array.isArray(pre.block_list) ? pre.block_list : blockList.map((_, i) => i);
+
+    for (let k = 0; k < toUpload.length; k++) {
+      const seq = toUpload[k];
+      const chunk = bytes.subarray(seq * BAIDU_BLOCK, Math.min(size, (seq + 1) * BAIDU_BLOCK));
+      const fd = new FormData();
+      fd.append("file", new Blob([chunk], { type: "application/octet-stream" }), "blob");
+      const url = "https://c.pcs.baidu.com/rest/2.0/pcs/superfile2?method=upload&app_id=250528"
+        + "&channel=chunlei&clienttype=0&web=1&path=" + encodeURIComponent(remotePath)
+        + "&uploadid=" + encodeURIComponent(uploadid) + "&partseq=" + seq;
+      const jr = JSON.parse((await gmReq({ method: "POST", url, data: fd })).responseText);
+      if (!jr.md5) throw new Error("分块 " + seq + " 上传失败");
+      prog.setRatio((k + 1) / toUpload.length);
+      prog.setState(`上传网盘 ${k + 1}/${toUpload.length} 块`);
+    }
+
+    const cr = JSON.parse((await gmReq({
+      method: "POST", url: "https://pan.baidu.com/api/create?" + common,
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      data: formBody({ path: remotePath, size, isdir: 0, block_list: JSON.stringify(blockList), uploadid, rtype: 3 }),
+    })).responseText);
+    if (cr.errno !== 0) throw new Error("create 合并失败 errno=" + cr.errno);
+    return remotePath;
+  }
+
+  // 统一保存出口：按面板选择存本地或传网盘。
+  async function dispatchSave(book, bytes, filename, ext, prog) {
+    if (saveTarget === "baidu") {
+      prog.setState("上传网盘…");
+      await baiduUpload(bytes, baiduRemotePath(book, filename), prog);
+      prog.setState("已上传网盘 ☁");
+    } else {
+      saveFile(bytes, filename, ext);
+    }
+  }
+
+  // =====================================================================
   // 七、保存文件
   // =====================================================================
   function anchorDownload(url, filename) {
@@ -1127,7 +1305,7 @@
       // 打包字节已生成，解码图片可以立刻释放，降低多卷连下时的内存峰值
       chapters.length = 0;
       release();
-      saveFile(bytes, safeName(`${book.title} - ${vol.title}`) + "." + ext, ext);
+      await dispatchSave(book, bytes, safeName(`${book.title} - ${vol.title}`) + "." + ext, ext, prog);
       bytes = null;
       prog.done();
     } finally {
@@ -1201,6 +1379,16 @@
         <label><input type="radio" name="bmd-fmt" value="pdf"> PDF</label>
         <button class="bmd-btn primary" id="bmd-start" style="margin-left:auto">开始下载</button>
       </div>
+      <div class="bmd-row">
+        <span style="color:#888">保存到：</span>
+        <label><input type="radio" name="bmd-dest" value="local" checked> 💾 本地</label>
+        <label><input type="radio" name="bmd-dest" value="baidu"> ☁ 百度网盘</label>
+        <span id="bmd-baidu-status" style="font-size:12px;color:#888"></span>
+      </div>
+      <div class="bmd-row bmd-hidden" id="bmd-baidu-row">
+        <span style="color:#888;white-space:nowrap">网盘根路径</span>
+        <input type="text" id="bmd-baidu-base" placeholder="/bilidownloader" />
+      </div>
       <div id="bmd-hint"></div>
       <div id="bmd-progress"></div>
     `;
@@ -1211,6 +1399,41 @@
     panel.querySelector("#bmd-none").addEventListener("click", () => setAll(false));
     panel.querySelector("#bmd-apply").addEventListener("click", onApplyExpr);
     panel.querySelector("#bmd-start").addEventListener("click", onStart);
+    panel.querySelectorAll('input[name="bmd-dest"]').forEach(
+      (r) => r.addEventListener("change", onDestChange));
+    const baseInput = panel.querySelector("#bmd-baidu-base");
+    baseInput.value = baiduBase();
+    baseInput.addEventListener("change", () => {
+      let v = (baseInput.value || "").trim() || "/bilidownloader";
+      if (!v.startsWith("/")) v = "/" + v;
+      baseInput.value = v;
+      setBaiduBase(v);
+    });
+  }
+
+  // 选择「百度网盘」时校验登录态：已登录显示昵称并展开根路径；未登录回退本地。
+  async function onDestChange() {
+    const dest = panel.querySelector('input[name="bmd-dest"]:checked').value;
+    const baseRow = panel.querySelector("#bmd-baidu-row");
+    const statusEl = panel.querySelector("#bmd-baidu-status");
+    if (dest !== "baidu") {
+      baseRow.classList.add("bmd-hidden");
+      statusEl.textContent = "";
+      return;
+    }
+    statusEl.style.color = "#888";
+    statusEl.textContent = "检测登录…";
+    const info = await baiduVerify();
+    if (info) {
+      statusEl.style.color = "#2e7d32";
+      statusEl.textContent = "已登录：" + info.nickname;
+      baseRow.classList.remove("bmd-hidden");
+    } else {
+      statusEl.style.color = "#c62828";
+      statusEl.textContent = "未登录，请先在浏览器登录 pan.baidu.com 后再试";
+      panel.querySelector('input[name="bmd-dest"][value="local"]').checked = true;
+      baseRow.classList.add("bmd-hidden");
+    }
   }
 
   function setHint(msg) {
@@ -1305,6 +1528,12 @@
       return;
     }
     const fmt = panel.querySelector('input[name="bmd-fmt"]:checked').value;
+    saveTarget = panel.querySelector('input[name="bmd-dest"]:checked').value;
+    if (saveTarget === "baidu") {
+      let v = (panel.querySelector("#bmd-baidu-base").value || "").trim() || "/bilidownloader";
+      if (!v.startsWith("/")) v = "/" + v;
+      setBaiduBase(v);
+    }
     setHint("");
     panel.querySelector("#bmd-start").disabled = true;
     panel.querySelector("#bmd-progress").innerHTML = "";

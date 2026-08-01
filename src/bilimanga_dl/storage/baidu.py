@@ -19,6 +19,7 @@ import time
 from pathlib import Path
 from typing import List, Optional, Tuple
 
+from curl_cffi import CurlMime
 from curl_cffi import requests as cffi
 
 from ..core.logutil import get_logger
@@ -29,7 +30,7 @@ log = get_logger("baidu")
 
 _UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
        "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
-LOGIN_URL = "https://pan.baidu.com/"
+LOGIN_URL = "https://passport.baidu.com/v2/?login&tpl=netdisk&u=https%3A%2F%2Fpan.baidu.com%2F"
 # 登录后这些 cookie 才算“真登录态”，其中 BDUSS 是核心。
 _READY_COOKIE = "BDUSS"
 
@@ -125,13 +126,16 @@ class BaiduClient:
             for seq in to_upload:
                 f.seek(seq * BLOCK_SIZE)
                 chunk = f.read(BLOCK_SIZE)
+                mp = CurlMime()
+                mp.addpart(name="file", filename="blob",
+                           content_type="application/octet-stream", data=chunk)
                 r = self.session.post(
                     "https://c.pcs.baidu.com/rest/2.0/pcs/superfile2",
                     params={"method": "upload", "app_id": "250528",
                             "channel": "chunlei", "clienttype": "0", "web": "1",
                             "BDUSS": bduss, "path": remote_path,
                             "uploadid": uploadid, "partseq": seq},
-                    files={"file": ("blob", chunk)}, timeout=180)
+                    multipart=mp, timeout=180)
                 jr = r.json()
                 if "md5" not in jr:
                     raise RuntimeError(f"分块 {seq} 上传失败：{jr}")
@@ -146,13 +150,14 @@ class BaiduClient:
         return remote_path
 
 
-# ---------------- 登录抓取（复用调用方的浏览器）----------------
+# ---------------- 现场登录抓取（浏览器窗口登录一次，经调试接口只抓当次 cookie）----------------
 def capture_login(net, timeout: int = 240,
                   on_status=None) -> Tuple[Optional[str], Optional[str]]:
-    """打开有头浏览器到百度登录页，轮询到出现 BDUSS 且校验通过后返回
-    ``(cookie_str, nickname)``；超时/取消返回 ``(None, None)``。
+    """打开一个浏览器窗口到百度登录页，等用户登录一次；登录后经调试接口读取到
+    BDUSS 且校验通过即返回 ``(cookie_str, nickname)``，超时/取消返回 ``(None, None)``。
 
-    :param net: :class:`net.Net`，需能开有头浏览器并读取其 cookie。
+    只抓“这次登录”产生的 cookie，不读取系统 cookie/密码库。该窗口用独立资料目录、
+    登录态持久化，之后无需再登。
     """
     def _say(msg):
         if on_status:
@@ -163,11 +168,10 @@ def capture_login(net, timeout: int = 240,
     except Exception as exc:  # noqa: BLE001
         _say(f"无法打开浏览器登录：{exc}")
         return None, None
-    _say("已打开浏览器，请在弹出的窗口里登录百度账号……")
+    _say("已打开浏览器窗口，请在里面登录百度账号（扫码/账号密码均可）……")
 
     deadline = time.time() + timeout
     while time.time() < deadline:
-        cookies = {}
         try:
             cookies = net.browser_cookies()
         except Exception:  # noqa: BLE001
