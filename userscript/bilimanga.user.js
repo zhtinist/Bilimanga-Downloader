@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Bilimanga 漫画/轻小说下载器
 // @namespace    https://github.com/zhtinist/Bilimanga-Downloader
-// @version      2.1.0
+// @version      2.1.1
 // @description  在 bilimanga 漫画 / 哔哩轻小说(bilinovel) 页面里一键把整卷下载成 EPUB / PDF。
 // @author       HTZHU
 // @license      MIT
@@ -16,7 +16,14 @@
 // @grant        GM_download
 // @grant        GM_xmlhttpRequest
 // @grant        GM_addStyle
-// @connect      *
+// 明确声明图片 CDN 与站点域名：安装时一次性授权、之后下载不再逐次弹跨域验证。
+// （Tampermonkey 会匹配子域，故 motiezw.com 覆盖 i.motiezw.com、readpai.com 覆盖 img3.readpai.com）
+// @connect      motiezw.com
+// @connect      readpai.com
+// @connect      bilimanga.net
+// @connect      bilicomic.net
+// @connect      bilinovel.com
+// @connect      linovelib.com
 // @run-at       document-idle
 // @updateURL    https://raw.githubusercontent.com/zhtinist/Bilimanga-Downloader/main/userscript/bilimanga.user.js
 // @downloadURL  https://raw.githubusercontent.com/zhtinist/Bilimanga-Downloader/main/userscript/bilimanga.user.js
