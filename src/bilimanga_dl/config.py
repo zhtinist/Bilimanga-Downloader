@@ -66,6 +66,9 @@ class Config:
     site_url: str = DEFAULT_SITE
     parallel_chapters: int = 12  # 并发上限（自适应 AIMD 从低起步，最多爬到这个值）
     request_timeout: int = 30
+    # 下载并发线程：漫画自适应并发（AIMD）的起始数与上限，可在设置里改。
+    concurrency_start: int = 4
+    concurrency_max: int = 8
 
     # 优化开关（3：限速 / 退避重试，二者独立，可同时开启）
     rate_limit_enabled: bool = False   # 默认不限速，尽可能快

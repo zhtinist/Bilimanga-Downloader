@@ -353,9 +353,11 @@ class Downloader:
         book_dir.mkdir(parents=True, exist_ok=True)
 
         # 线程数：固定从 4 起步，自适应在 [2, 8] 间升降（不再受用户配置的手填值影响）。
-        limiter = _Adaptive(start=4, lo=2, hi=8, on_change=on_concurrency)
+        _hi = max(2, int(getattr(self.config, "concurrency_max", 8)))
+        _start = max(1, min(int(getattr(self.config, "concurrency_start", 4)), _hi))
+        limiter = _Adaptive(start=_start, lo=2, hi=_hi, on_change=on_concurrency)
         limiter.start()  # 启动每秒错误率采样的并发调节器
-        img_pool = ThreadPoolExecutor(max_workers=8)
+        img_pool = ThreadPoolExecutor(max_workers=_hi)
         pkg_pool = ThreadPoolExecutor(max_workers=2)  # 后台校对+打包
         outputs: list = []
         out_lock = threading.Lock()

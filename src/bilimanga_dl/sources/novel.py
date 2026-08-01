@@ -46,7 +46,9 @@ class NovelSource(Source):
     def _ensure_mobile(self):
         if self._mobile is None:
             from ..novel_mobile import MobileNovelDownloader
-            self._mobile = MobileNovelDownloader(num_thread=4,
+            # 正文抓取仍串行（限流安全）；num_thread 只用于插图并发下载。
+            nt = max(1, int(getattr(self.config, "concurrency_max", 4)))
+            self._mobile = MobileNovelDownloader(num_thread=nt,
                                                  proxy=self.config.proxy or "")
         return self._mobile
 

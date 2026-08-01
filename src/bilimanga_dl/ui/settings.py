@@ -33,7 +33,17 @@ def open_settings(config: Config, use_terminal: bool = True) -> None:
     v = input(f"默认格式 epub/pdf [{config.default_format}]: ").strip().lower()
     if v in ("epub", "pdf"):
         config.default_format = v
-    # 并发线程数不再手填：固定 4 起步、自适应升降。
+
+    # 下载并发线程（漫画自适应并发 AIMD 的起始数与上限）
+    v = input(f"并发-起始线程数 [{config.concurrency_start}]: ").strip()
+    if v.isdigit() and int(v) >= 1:
+        config.concurrency_start = int(v)
+    v = input(f"并发-上限线程数 [{config.concurrency_max}]: ").strip()
+    if v.isdigit() and int(v) >= 1:
+        config.concurrency_max = int(v)
+    config.concurrency_max = max(2, config.concurrency_max)
+    config.concurrency_start = max(1, min(config.concurrency_start, config.concurrency_max))
+
     cur_proxy = config.proxy or "自动(用环境变量，连不上自动直连)"
     v = input(f"代理 [{cur_proxy}]（输入 none 表示强制直连；直接回车不改）: ").strip()
     if v.lower() == "none":
@@ -55,6 +65,21 @@ def open_settings(config: Config, use_terminal: bool = True) -> None:
     v = input(f"启用调试日志？ y/n [{'y' if config.debug else 'n'}]: ").strip().lower()
     if v in ("y", "n"):
         config.debug = (v == "y")
+
+    # 百度网盘
+    if config.baidu_cookie:
+        print(f"百度网盘：已连接（{config.baidu_nickname or '百度用户'}）")
+        v = input(f"网盘上传根路径 [{config.baidu_upload_base}]: ").strip()
+        if v:
+            config.baidu_upload_base = v if v.startswith("/") else "/" + v
+        v = input("断开百度账号？输入 yes 断开（清除本地登录态）: ").strip().lower()
+        if v == "yes":
+            config.baidu_cookie = ""
+            config.baidu_nickname = ""
+            print("  已断开百度账号。")
+    else:
+        print("百度网盘：未连接（回主界面输入 c 连接账号）")
+
     config.save()
     print("设置已保存。")
     print(f"文件将保存到：{config.output_path()}")

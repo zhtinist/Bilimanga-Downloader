@@ -9,14 +9,21 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
+import os
 import subprocess
 import sys
+import tempfile
 import time
-from typing import Optional, Tuple
+from pathlib import Path
+from typing import List, Optional, Tuple
 
 from curl_cffi import requests as cffi
 
 from ..core.logutil import get_logger
+
+BLOCK_SIZE = 4 * 1024 * 1024  # 百度分片上传固定 4MB/块
 
 log = get_logger("baidu")
 
@@ -80,6 +87,64 @@ class BaiduClient:
         log.warning("百度校验失败：errno=%s", j.get("errno"))
         return None
 
+    def _bduss(self) -> str:
+        for part in self.cookie.split(";"):
+            k, _, v = part.strip().partition("=")
+            if k == "BDUSS":
+                return v
+        return ""
+
+    def upload_file(self, local_path: str, remote_path: str) -> str:
+        """分片上传一个本地文件到网盘 ``remote_path``（自动建父目录）。
+
+        流程：precreate（预创建，报块 md5）→ superfile2（逐块上传）→ create（合并）。
+        非官方接口，errno 非 0 即抛错。
+        """
+        if not self.bdstoken and self.verify() is None:
+            raise RuntimeError("百度登录态无效（无法取得 bdstoken），请重新连接。")
+        size = os.path.getsize(local_path)
+        blocks = _block_md5s(local_path)
+        block_json = json.dumps(blocks)
+        common = {"channel": "chunlei", "web": "1", "app_id": "250528",
+                  "bdstoken": self.bdstoken, "clienttype": "0"}
+
+        pre = self.session.post(
+            "https://pan.baidu.com/api/precreate", params=common,
+            data={"path": remote_path, "size": size, "isdir": "0",
+                  "autoinit": "1", "rtype": "3", "block_list": block_json},
+            timeout=30).json()
+        if pre.get("errno") != 0:
+            raise RuntimeError(f"precreate 失败 errno={pre.get('errno')}")
+        uploadid = pre.get("uploadid", "")
+        to_upload = pre.get("block_list")
+        if not to_upload and to_upload != []:
+            to_upload = list(range(len(blocks)))
+
+        bduss = self._bduss()
+        with open(local_path, "rb") as f:
+            for seq in to_upload:
+                f.seek(seq * BLOCK_SIZE)
+                chunk = f.read(BLOCK_SIZE)
+                r = self.session.post(
+                    "https://c.pcs.baidu.com/rest/2.0/pcs/superfile2",
+                    params={"method": "upload", "app_id": "250528",
+                            "channel": "chunlei", "clienttype": "0", "web": "1",
+                            "BDUSS": bduss, "path": remote_path,
+                            "uploadid": uploadid, "partseq": seq},
+                    files={"file": ("blob", chunk)}, timeout=180)
+                jr = r.json()
+                if "md5" not in jr:
+                    raise RuntimeError(f"分块 {seq} 上传失败：{jr}")
+
+        cr = self.session.post(
+            "https://pan.baidu.com/api/create", params=common,
+            data={"path": remote_path, "size": size, "isdir": "0",
+                  "block_list": block_json, "uploadid": uploadid, "rtype": "3"},
+            timeout=30).json()
+        if cr.get("errno") != 0:
+            raise RuntimeError(f"create 合并失败 errno={cr.get('errno')}")
+        return remote_path
+
 
 # ---------------- 登录抓取（复用调用方的浏览器）----------------
 def capture_login(net, timeout: int = 240,
@@ -124,3 +189,51 @@ def capture_login(net, timeout: int = 240,
         pass
     _say("登录超时（未检测到登录态）。")
     return None, None
+
+
+# ---------------- 分片 md5 + 存储插件 ----------------
+def _block_md5s(path: str) -> List[str]:
+    md5s: List[str] = []
+    with open(path, "rb") as f:
+        while True:
+            chunk = f.read(BLOCK_SIZE)
+            if not chunk:
+                break
+            md5s.append(hashlib.md5(chunk).hexdigest())
+    return md5s or [hashlib.md5(b"").hexdigest()]
+
+
+from .base import Storage  # noqa: E402
+from ..core.registry import storages  # noqa: E402
+from ..downloader import safe_name  # noqa: E402
+
+
+@storages.register
+class BaiduStorage(Storage):
+    """百度网盘存储：成品先落临时目录，逐卷上传到 <base>/<分类>/<书名>/ 后删本地。"""
+    name = "baidu"
+    label = "上传到百度网盘"
+
+    def __init__(self, config):
+        self.config = config
+        self.client = BaiduClient(config.baidu_cookie or "")
+
+    def is_ready(self) -> bool:
+        return bool(self.config.baidu_cookie)
+
+    def status_label(self) -> str:
+        nick = self.config.baidu_nickname
+        return f"百度网盘（{nick}）" if nick else "百度网盘"
+
+    def stage_dir(self, category: str, book_title: str) -> Path:
+        return Path(tempfile.mkdtemp(prefix="bili_up_"))
+
+    def commit(self, path: Path, category: str, book_title: str) -> str:
+        base = (self.config.baidu_upload_base or "/bilidownloader").rstrip("/")
+        remote = f"{base}/{category}/{safe_name(book_title)}/{path.name}"
+        self.client.upload_file(str(path), remote)
+        try:
+            path.unlink()          # 上传成功后删临时文件
+        except Exception:  # noqa: BLE001
+            pass
+        return f"百度网盘:{remote}"

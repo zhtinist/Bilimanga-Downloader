@@ -144,6 +144,7 @@ class _Shared:
         self.config = config
         self._net: Optional[Net] = None
         self._sources: dict = {}       # kind -> Source 实例（会话/引擎跨本复用）
+        self._baidu: Optional[tuple] = None   # (connected, nickname) 缓存
 
     def ensure_net(self) -> Net:
         if self._net is None:
@@ -157,10 +158,44 @@ class _Shared:
             self._sources[kind] = cls(self.ensure_net(), self.config)
         return self._sources[kind]
 
-    def storage(self):
-        """当前下载去向。2.0.0 只有本地；3.0.0 接入百度后按设置选择。"""
+    def storage(self, target: str = "local"):
+        """按去向返回存储插件：baidu（已连接时）或本地。"""
+        if target == "baidu" and self.config.baidu_cookie:
+            from ..storage.baidu import BaiduStorage
+            return BaiduStorage(self.config)
         from ..storage.local import LocalStorage
         return LocalStorage(self.config.output_path())
+
+    def baidu_status(self) -> tuple:
+        """(是否已连接, 昵称)。启动/首次访问时校验一次存的登录态，失效则清缓存。"""
+        if self._baidu is None:
+            if self.config.baidu_cookie:
+                from ..storage.baidu import BaiduClient
+                nick = BaiduClient(self.config.baidu_cookie).verify()
+                if nick:
+                    if nick != self.config.baidu_nickname:
+                        self.config.baidu_nickname = nick
+                        self.config.save()
+                    self._baidu = (True, nick)
+                else:
+                    self._baidu = (False, None)   # 登录态失效
+            else:
+                self._baidu = (False, None)
+        return self._baidu
+
+    def connect_baidu(self) -> bool:
+        """打开浏览器登录百度，抓登录态并保存；成功发桌面通知。"""
+        from ..storage.baidu import capture_login, desktop_notify
+        cookie, nick = capture_login(self.ensure_net(),
+                                     on_status=lambda m: _print(f"  [dim]{m}[/dim]"))
+        if cookie and nick:
+            self.config.baidu_cookie = cookie
+            self.config.baidu_nickname = nick
+            self.config.save()
+            self._baidu = (True, nick)
+            desktop_notify("百度云已连接", f"账号：{nick}，之后可上传到网盘。")
+            return True
+        return False
 
     def close(self) -> None:
         for s in self._sources.values():
@@ -242,7 +277,12 @@ def _step_input(st: _State) -> str:
     _print("粘贴漫画或轻小说的网址（详情页 / 目录页），或输入书号，自动识别类型：")
     _print("  漫画   https://www.bilimanga.net/detail/703.html")
     _print("  轻小说 https://www.bilinovel.com/novel/2139.html")
-    _print("[dim]s=设置   q=退出[/dim]")
+    connected, nick = st.shared.baidu_status()
+    if connected:
+        _print(f"[green]☁ 百度云：{nick}[/green]（下载时可选存本地 / 上传网盘）")
+    else:
+        _print("[grey37]☁ 百度云：未连接[/grey37]（下载只能存本地；输入 c 连接）")
+    _print("[dim]s=设置   c=连接百度云   q=退出[/dim]")
     raw = _ask_text("→ 网址或书号：")
     if raw is None:
         st.exit_app = True
@@ -253,6 +293,17 @@ def _step_input(st: _State) -> str:
         return QUIT
     if raw.lower() in ("s", "设置", "setting", "settings"):
         open_settings(st.config, use_terminal=True)
+        _pause("\n按回车返回……")
+        return GO_BACK
+    if raw.lower() in ("c", "连接", "百度", "baidu"):
+        if st.shared.baidu_status()[0]:
+            _print(f"[green]已连接百度云：{st.shared.baidu_status()[1]}[/green]"
+                   "（如需换号，可到设置里断开后重连）")
+        else:
+            _print("即将打开浏览器，请在弹出窗口登录百度账号（登录后自动检测）……")
+            ok = st.shared.connect_baidu()
+            _print(f"[green]✓ 已连接：{st.shared.baidu_status()[1]}[/green]" if ok
+                   else "[yellow]未完成登录（超时/取消）。[/yellow]")
         _pause("\n按回车返回……")
         return GO_BACK
     if not raw:
@@ -339,7 +390,20 @@ def _step_format(st: _State) -> str:
 def _step_download(st: _State) -> str:
     _clear()
     _breadcrumb(4, "轻小说" if st.is_novel else "漫画")
-    storage = st.shared.storage()
+    # 选择保存去向：已连接百度云才可选网盘；否则强制本地。
+    target = "local"
+    connected, nick = st.shared.baidu_status()
+    if connected:
+        choice = _ask_select(
+            "保存到哪里？（↑↓ 选择）",
+            [f"💾 本地（{st.config.output_path()}）",
+             f"☁ 百度网盘（{nick}）", "← 返回上一步"])
+        if choice is None:
+            return QUIT
+        if choice.startswith("←"):
+            return GO_BACK
+        target = "baidu" if choice.startswith("☁") else "local"
+    storage = st.shared.storage(target)
     _print(f"保存去向：[bold]{storage.status_label()}[/bold]\n")
     index_map = {v.index: v for v in st.book.volumes}
     volumes = [index_map[i] for i in st.selected if i in index_map]
