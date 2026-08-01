@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Bilimanga 漫画/轻小说下载器
 // @namespace    https://github.com/zhtinist/Bilimanga-Downloader
-// @version      3.0.2
+// @version      3.0.3
 // @description  在 bilimanga 漫画 / 哔哩轻小说(bilinovel) 页面里一键把整卷下载成 EPUB / PDF，可存本地或上传到你的百度网盘。
 // @author       HTZHU
 // @license      MIT
@@ -64,16 +64,12 @@
   }
 
   // ===================== 调试日志 =====================
-  // 勾选调试后：让用户选 log.txt 落点，边下边把日志“持续写盘”。关键点——即便某个
-  // await 卡死，事件循环并没有停，setInterval 定时刷盘照常执行，能把日志记到卡住的
-  // 那一刻，便于定位是哪一章/哪张图/哪个请求卡住。不支持 File System Access 或用户
-  // 取消时，退回“结束时把缓冲整体下载成 log.txt”。
+  // 勾选「调试日志」即开始把过程记进内存缓冲；随时点面板「⬇ 下载日志」按钮，把当前
+  // 日志存成 log.txt 直接下到浏览器下载目录。关键：即便进度条卡住（卡的只是某个等待
+  // 中的请求，页面事件循环没停），点按钮依然能立刻拿到“卡住那一刻为止”的完整日志，
+  // 从而定位是哪一章 / 哪张图 / 哪个网址卡住。
   let DBG = false;
   let logBuffer = [];
-  let logHandle = null;        // FileSystemFileHandle
-  let logDirty = false;
-  let logFlushing = false;
-  let logFlushTimer = null;
   const t0log = Date.now();
 
   function dlog() {
@@ -84,53 +80,16 @@
       (a) => (typeof a === "string" ? a : (() => { try { return JSON.stringify(a); } catch (e) { return String(a); } })())
     ).join(" ");
     logBuffer.push(line);
-    logDirty = true;
     try { console.debug("[bmd]", line); } catch (e) {}
   }
 
-  async function flushLog() {
-    if (logFlushing || !logDirty || !logHandle) return;
-    logFlushing = true;
-    logDirty = false;
-    try {
-      const w = await logHandle.createWritable();
-      await w.write(logBuffer.join("\n") + "\n");
-      await w.close();
-    } catch (e) {
-      logDirty = true;      // 写失败下轮重试
-    } finally {
-      logFlushing = false;
-    }
-  }
-
-  async function startDebugLog() {
+  // 勾选调试时调用：清空缓冲、写头部信息，开始记录。
+  function startDebugCapture() {
     logBuffer = [];
-    logDirty = false;
-    logHandle = null;
-    // showSaveFilePicker 必须在用户手势里同步发起（onStart 由点击触发，此处之前无 await）
-    if (typeof window.showSaveFilePicker === "function") {
-      try {
-        logHandle = await window.showSaveFilePicker({
-          suggestedName: "log.txt",
-          types: [{ description: "文本日志", accept: { "text/plain": [".txt"] } }],
-        });
-      } catch (e) { logHandle = null; }   // 用户取消 → 退回结束时下载
-    }
-    if (logFlushTimer) clearInterval(logFlushTimer);
-    logFlushTimer = setInterval(() => { flushLog(); }, 1500);
+    DBG = true;
     dlog("=== 调试日志开始 ===");
     dlog("UA", navigator.userAgent);
-    dlog("持续写盘方式", logHandle ? "File System Access（实时写 log.txt）" : "内存缓冲（结束时下载 log.txt）");
-  }
-
-  async function stopDebugLog() {
-    dlog("=== 调试日志结束 ===");
-    logDirty = true;
-    await flushLog();
-    if (logFlushTimer) { clearInterval(logFlushTimer); logFlushTimer = null; }
-    if (!logHandle) {          // 没拿到文件句柄：把缓冲整体存成 log.txt 到下载目录
-      try { saveText(logBuffer.join("\n") + "\n", "log.txt"); } catch (e) {}
-    }
+    dlog("页面", location.href);
   }
 
   function saveText(text, filename) {
@@ -144,6 +103,13 @@
       } catch (e) { anchorDownload(url, filename); }
     } else { anchorDownload(url, filename); }
     setTimeout(() => URL.revokeObjectURL(url), 60000);
+  }
+
+  // 点「下载日志」：把当前缓冲直接下成 log.txt。返回是否有内容可下。
+  function downloadLog() {
+    if (!logBuffer.length) return false;
+    saveText(logBuffer.join("\n") + "\n", "log.txt");
+    return true;
   }
 
   // 带超时的 fetch：卡住的请求会自动 abort，避免拖死并发池里的一个 worker。
@@ -1539,9 +1505,10 @@
         <input type="text" id="bmd-baidu-base" placeholder="/bilidownloader" />
       </div>
       <div class="bmd-row">
-        <label title="记录每次请求/每章/每张图，卡住时也能定位；日志写到 log.txt">
-          <input type="checkbox" id="bmd-debug"> 🐞 调试日志（出问题时勾选，生成 log.txt）
+        <label title="勾选后开始记录每次请求/每章/每张图，卡住时也能定位">
+          <input type="checkbox" id="bmd-debug"> 🐞 调试日志
         </label>
+        <button class="bmd-btn" id="bmd-savelog" style="margin-left:auto" title="把当前日志下载成 log.txt 到浏览器下载目录">⬇ 下载日志</button>
       </div>
       <div id="bmd-hint"></div>
       <div id="bmd-progress"></div>
@@ -1562,6 +1529,20 @@
       if (!v.startsWith("/")) v = "/" + v;
       baseInput.value = v;
       setBaiduBase(v);
+    });
+    // 调试日志：勾选即开始记录；「下载日志」按钮随时把 log.txt 下到浏览器下载目录。
+    panel.querySelector("#bmd-debug").addEventListener("change", (e) => {
+      if (e.target.checked) {
+        startDebugCapture();
+        setHint("调试日志已开启，开始记录；下载卡住时点「⬇ 下载日志」把 log.txt 发我。");
+      } else {
+        DBG = false;
+        setHint("");
+      }
+    });
+    panel.querySelector("#bmd-savelog").addEventListener("click", () => {
+      if (downloadLog()) setHint("已下载 log.txt 到浏览器下载目录。");
+      else setHint("暂无日志：请先勾选「🐞 调试日志」再开始下载。");
     });
   }
 
@@ -1688,13 +1669,13 @@
       if (!v.startsWith("/")) v = "/" + v;
       setBaiduBase(v);
     }
-    // 调试日志：必须在这里（用户点击手势内、任何 await 之前）发起文件选择框。
+    // 调试日志：勾选则本次下载从头记录一份新日志（点「⬇ 下载日志」随时导出）。
     DBG = panel.querySelector("#bmd-debug").checked;
     if (DBG) {
-      await startDebugLog();
+      startDebugCapture();
       dlog("书", currentBook.title, currentBook.kind, "选中卷", selected.join(","), "格式=" + fmt, "去向=" + saveTarget);
     }
-    setHint(DBG ? (logHandle ? "调试中：日志实时写入你选的 log.txt" : "调试中：日志将在结束时下载为 log.txt") : "");
+    setHint(DBG ? "调试记录中：下载卡住时点「⬇ 下载日志」把 log.txt 发我。" : "");
     panel.querySelector("#bmd-start").disabled = true;
     panel.querySelector("#bmd-progress").innerHTML = "";
 
@@ -1717,7 +1698,10 @@
       }
     } finally {
       panel.querySelector("#bmd-start").disabled = false;
-      if (DBG) { await stopDebugLog(); DBG = false; }
+      if (DBG) {
+        dlog("=== 本次下载结束 ===");
+        setHint("下载结束。若刚才卡住或有问题，点「⬇ 下载日志」把 log.txt 发我。");
+      }
     }
   }
 
