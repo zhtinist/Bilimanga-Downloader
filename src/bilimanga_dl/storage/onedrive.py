@@ -80,7 +80,9 @@ class OneDriveClient:
 
     # 校验并取账号显示名（邮箱/名字）。失败返回 None。
     def verify(self) -> Optional[str]:
-        if not self._refresh():
+        # 已有 access_token 就直接用，避免多余刷新（个人账号 refresh_token 用一次即轮换，
+        # 多刷一次会把刚拿到的令牌作废）。
+        if not self.access_token and not self._refresh():
             return None
         try:
             r = self.session.get(_GRAPH + "/me", headers=self._auth_headers(), timeout=20)
@@ -198,9 +200,12 @@ def device_code_login(client_id: str, on_status=None,
         except Exception:  # noqa: BLE001
             continue
         if "access_token" in tok:
-            refresh = tok.get("refresh_token", "")
-            name = OneDriveClient(client_id, refresh).verify() or "OneDrive 用户"
-            return refresh, name
+            # 用设备码这次直接拿到的 access_token 校验（不再刷新，避免把 refresh_token 提前
+            # 轮换作废）；返回的 refresh_token 就是这次登录拿到的、仍然有效的那个。
+            client = OneDriveClient(client_id, tok.get("refresh_token", ""))
+            client.access_token = tok["access_token"]
+            name = client.verify() or "OneDrive 用户"
+            return client.refresh_token, name
         err = tok.get("error")
         if err in ("authorization_pending", "slow_down"):
             if err == "slow_down":
