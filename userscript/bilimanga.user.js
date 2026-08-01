@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Bilimanga 漫画/轻小说下载器
 // @namespace    https://github.com/zhtinist/Bilimanga-Downloader
-// @version      3.0.3
+// @version      3.0.4
 // @description  在 bilimanga 漫画 / 哔哩轻小说(bilinovel) 页面里一键把整卷下载成 EPUB / PDF，可存本地或上传到你的百度网盘。
 // @author       HTZHU
 // @license      MIT
@@ -244,6 +244,61 @@
     }
     return { acquire, release, penalize, reward, waitCooldown };
   })();
+
+  // 图片自适应并发（AIMD，照搬命令行版思路）：图床（尤其漫画 i.motiezw.com）按 IP 限流
+  // 很凶，固定 4 并发会立刻 429 风暴、大量图被丢。这里用“信号量 + 自适应”控制真正并发：
+  // 命中 429 立刻**并发减半**（乘性减），连续成功若干张再**+1**（加性增），自动收敛到图床
+  // 能扛的速率，让图片第一次就抓成功，而不是被丢后堆到串行补漏里慢慢重下（看着像卡住）。
+  const IMG_MAX = 6;      // 上限（也是 runPool 起的 worker 数）
+  const imgFlow = (() => {
+    let permits = 4, inflight = 0, okStreak = 0;
+    const MIN = 1;
+    const q = [];
+    function pump() {
+      while (inflight < permits && q.length) { inflight += 1; (q.shift())(); }
+    }
+    return {
+      acquire() { return new Promise((res) => { q.push(res); pump(); }); },
+      release() { inflight = Math.max(0, inflight - 1); pump(); },
+      on429() {
+        okStreak = 0;
+        const np = Math.max(MIN, Math.floor(permits / 2));
+        if (np !== permits) { permits = np; dlog("并发↓", permits, "(命中429)"); }
+      },
+      onOK() {
+        okStreak += 1;
+        if (permits < IMG_MAX && okStreak >= 8) {
+          permits += 1; okStreak = 0; dlog("并发↑", permits);
+        }
+      },
+      get value() { return permits; },
+    };
+  })();
+
+  // 抓一张图（含自适应并发 + 就地重试）；命中 429 就降并发、退避后再试，尽量不丢图。
+  async function fetchImageAdaptive(url, label, tries = 5) {
+    await imgFlow.acquire();
+    try {
+      for (let attempt = 0; attempt < tries; attempt++) {
+        dlog("图片 取", label, "第" + (attempt + 1) + "次", "并发=" + imgFlow.value, url);
+        try {
+          const img = await withTimeout(fetchImageAsJpeg(url), 40000, "下载图片");
+          imgFlow.onOK();
+          dlog("图片 OK", label);
+          return img;
+        } catch (e) {
+          const msg = (e && e.message) || "";
+          if (msg.includes("429")) imgFlow.on429();
+          dlog("图片 失败", label, "第" + (attempt + 1) + "次", msg);
+          if (attempt < tries - 1) await sleep((msg.includes("429") ? 800 : 500) * Math.min(attempt + 1, 4));
+        }
+      }
+      dlog("图片 放弃", label, url);
+      return null;
+    } finally {
+      imgFlow.release();
+    }
+  }
 
   // 页面抓取：走限流闸门；命中 429/占位页则全体冷却后重试；真 CF 质询交用户手动过。
   async function fetchText(url, tries = 8) {
@@ -583,25 +638,28 @@
     dlog("插图 共", imgUrls.length, "张");
     const images = {};
     let imgDone = 0;
-    await runPool(imgUrls, IMAGE_CONCURRENCY, async (u) => {
+    // 自适应并发抓图（命中 429 自动降并发，避免图床限流风暴）。
+    await runPool(imgUrls, IMG_MAX, async (u) => {
       const idx = imgMap[u];
-      // 边下边补：单张就地重试 3 次，命中限流先等全局冷却。每次取图套 40s 总超时，
-      // 卡死的请求会被 abort 并重试，不拖死并发池。
-      for (let attempt = 0; attempt < 3; attempt++) {
-        await gate.waitCooldown();
-        dlog("插图 取", idx, "第" + (attempt + 1) + "次", u);
-        try {
-          images[idx] = await withTimeout(fetchImageAsJpeg(u), 40000, "下载插图");
-          imgDone += 1;
-          dlog("插图 OK", idx, images[idx].width + "x" + images[idx].height, "(" + imgDone + "/" + imgUrls.length + ")");
-          return;
-        } catch (e) {
-          dlog("插图 失败", idx, "第" + (attempt + 1) + "次", e && e.message);
-          if (attempt < 2) await sleep(500 * (attempt + 1));
-        }
+      const img = await fetchImageAdaptive(u, "插图" + idx);
+      if (img) {
+        images[idx] = img;
+        imgDone += 1;
+        prog.setState(`下载插图 ${imgDone}/${imgUrls.length}`);
       }
-      dlog("插图 放弃", idx, u);
     });
+    // 补漏轮：仍缺的串行重下（串行天然只 1 并发，最稳；每张给足 8 次）。最多两轮。
+    for (let round = 0; round < 2; round++) {
+      const miss = imgUrls.filter((u) => !images[imgMap[u]]);
+      if (!miss.length) break;
+      dlog("插图补漏 第" + (round + 1) + "轮", miss.length, "张");
+      prog.setState(`补漏 ${miss.length} 张…`);
+      for (const u of miss) {
+        const img = await fetchImageAdaptive(u, "插图" + imgMap[u] + "(补)", 8);
+        if (img) { images[imgMap[u]] = img; imgDone += 1; }
+      }
+    }
+    dlog("插图完成", Object.keys(images).length + "/" + imgUrls.length);
 
     prog.setState("打包中…");
     dlog("打包中…", "章=" + chapters.length, "图=" + Object.keys(images).length);
@@ -1308,8 +1366,7 @@
   // =====================================================================
   // 八、并发池 + 逐卷处理
   // =====================================================================
-  const IMAGE_CONCURRENCY = 4;
-
+  // 图片实际并发由 imgFlow（自适应）控制；这里 runPool 只按 IMG_MAX 起足够的 worker。
   async function runPool(items, limit, worker) {
     let idx = 0;
     const runners = [];
@@ -1364,37 +1421,30 @@
 
       dlog("▶ 开始卷", vol.index, vol.title, "图片总数=" + total);
       let done = 0;
+      // 自适应并发抓图：命中 429 自动降并发，避免图床（i.motiezw.com）限流风暴。
       const fetchOne = async (t) => {
-        // 单张最多试 3 次（网络抖动/429 常是暂时性）；命中限流先等全局冷却。
-        // 每次取图套 40s 总超时，卡死的请求会被放弃并重试，不拖死并发池。
-        for (let attempt = 0; attempt < 3; attempt++) {
-          await gate.waitCooldown();
-          dlog("图片 取", t.ci + ":" + t.ii, "第" + (attempt + 1) + "次", t.url);
-          try {
-            chapterData[t.ci].images[t.ii] = await withTimeout(fetchImageAsJpeg(t.url), 40000, "下载图片");
-            dlog("图片 OK", t.ci + ":" + t.ii);
-            return;
-          } catch (e) {
-            dlog("图片 失败", t.ci + ":" + t.ii, "第" + (attempt + 1) + "次", e && e.message);
-            if (attempt < 2) await sleep(500 * (attempt + 1));
-          }
-        }
-        dlog("图片 放弃", t.ci + ":" + t.ii, t.url);
+        const img = await fetchImageAdaptive(t.url, t.ci + ":" + t.ii);
+        if (img) chapterData[t.ci].images[t.ii] = img;
       };
-      await runPool(tasks, IMAGE_CONCURRENCY, async (t) => {
+      await runPool(tasks, IMG_MAX, async (t) => {
         await fetchOne(t);
         done += 1;
         prog.setRatio(done / total);
         prog.setState(`下载中 ${done}/${total}`);
       });
 
-      // 补漏轮：仍缺失的再单线程重试一遍，尽量补齐（同命令行版的“最终补齐”）
-      const missing = tasks.filter((t) => !chapterData[t.ci].images[t.ii]);
-      if (missing.length) {
-        dlog("补漏", missing.length, "张");
+      // 补漏轮：仍缺失的串行重下（串行天然只 1 并发，最稳；每张给足 8 次）。最多两轮。
+      for (let round = 0; round < 2; round++) {
+        const missing = tasks.filter((t) => !chapterData[t.ci].images[t.ii]);
+        if (!missing.length) break;
+        dlog("补漏 第" + (round + 1) + "轮", missing.length, "张");
         prog.setState(`补漏 ${missing.length} 张…`);
-        for (const t of missing) await fetchOne(t);
+        for (const t of missing) {
+          const img = await fetchImageAdaptive(t.url, t.ci + ":" + t.ii + "(补)", 8);
+          if (img) { chapterData[t.ci].images[t.ii] = img; done += 1; prog.setRatio(done / total); }
+        }
       }
+      dlog("图片完成", tasks.filter((t) => chapterData[t.ci].images[t.ii]).length + "/" + total);
 
       const chapters = chapterData.map((c) => ({ title: c.title, images: c.images.filter(Boolean) }));
       if (!chapters.some((c) => c.images.length > 0)) {
