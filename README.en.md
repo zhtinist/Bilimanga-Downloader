@@ -4,6 +4,12 @@
 
 Download manga from [bilimanga.net](https://www.bilimanga.net/) and light novels from [bilinovel](https://www.bilinovel.com), packaged per volume into **EPUB** or **PDF** for your e-reader.
 
+Two ways to use it:
+
+- **🐵 Userscript (no Python needed)**: install a browser extension and click to download on any book page.
+  → [Install on Greasy Fork](https://greasyfork.org/zh-CN/scripts/588995-bilimanga-%E6%BC%AB%E7%94%BB-%E8%BD%BB%E5%B0%8F%E8%AF%B4%E4%B8%8B%E8%BD%BD%E5%99%A8) (see [`userscript/`](userscript/README.md))
+- **💻 Command line (below)**: pure Python, great for batch downloads and automation.
+
 ## Quick start
 
 1. Download `Bilimanga-Downloader-CLI.zip` from [Releases](../../releases) and unzip it.

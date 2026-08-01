@@ -4,6 +4,12 @@
 
 下载 [bilimanga.net](https://www.bilimanga.net/) 的漫画和 [哔哩轻小说](https://www.bilinovel.com) 的轻小说，按卷打包成 **EPUB** 或 **PDF**，方便在阅读器里看。
 
+两种用法，任选其一：
+
+- **🐵 油猴脚本版（免装 Python，推荐轻度使用）**：装个浏览器扩展就能用，在书页点一下即可下载。
+  → [Greasy Fork 一键安装](https://greasyfork.org/zh-CN/scripts/588995-bilimanga-%E6%BC%AB%E7%94%BB-%E8%BD%BB%E5%B0%8F%E8%AF%B4%E4%B8%8B%E8%BD%BD%E5%99%A8)（详见 [`userscript/`](userscript/README.md)）
+- **💻 命令行版（本页下方）**：纯 Python，适合批量下载、自动化。
+
 ## 快速开始
 
 1. 到 [Releases](../../releases) 下载 `Bilimanga-Downloader-CLI.zip` 并解压。
