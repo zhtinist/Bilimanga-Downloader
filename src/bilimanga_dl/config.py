@@ -112,8 +112,17 @@ class Config:
     baidu_nickname: str = ""
     # 上传根路径（网盘内），实际路径为 <base>/漫画|小说/<书名>/<文件>。
     baidu_upload_base: str = "/bilidownloader"
-    # 下载去向：local（存本地）| baidu（传网盘）。未连接百度云时强制 local。
+    # 下载去向：local（存本地）| baidu（传网盘）| onedrive。未连接对应网盘时强制 local。
     download_target: str = "local"
+
+    # ---- OneDrive（微软 Graph API，OAuth2 设备码方式）----
+    # 每个用户用自己的账号：自己在 Azure 免费注册一个「公共客户端」应用拿 client_id
+    # （3 步，见 README），填在这里；登录走设备码流程，拿到 refresh_token 长期免登录。
+    # ⚠️ onedrive_refresh_token 等于账号访问凭证，请勿外泄。
+    onedrive_client_id: str = ""
+    onedrive_refresh_token: str = ""
+    onedrive_account: str = ""          # 显示名/邮箱，仅用于状态展示
+    onedrive_upload_base: str = "/bilidownloader"
 
     # ---- 读写 ----
     @classmethod

@@ -38,11 +38,13 @@ _READY_COOKIE = "BDUSS"
 # ---------------- 桌面通知 ----------------
 def desktop_notify(title: str, message: str) -> None:
     """尽力发一条系统桌面通知；失败则退回控制台打印。"""
+    def _as(s: str) -> str:  # 转成 AppleScript 双引号字符串（转义 \ 和 "）
+        return '"' + str(s).replace("\\", "\\\\").replace('"', '\\"') + '"'
     try:
         if sys.platform == "darwin":
             subprocess.run(
                 ["osascript", "-e",
-                 f'display notification {message!r} with title {title!r}'],
+                 f"display notification {_as(message)} with title {_as(title)}"],
                 check=False)
             return
         if sys.platform.startswith("win"):

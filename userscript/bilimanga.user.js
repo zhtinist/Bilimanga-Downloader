@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Bilimanga 漫画/轻小说下载器
 // @namespace    https://github.com/zhtinist/Bilimanga-Downloader
-// @version      3.0.4
+// @version      3.1.0
 // @description  在 bilimanga 漫画 / 哔哩轻小说(bilinovel) 页面里一键把整卷下载成 EPUB / PDF，可存本地或上传到你的百度网盘。
 // @author       HTZHU
 // @license      MIT
@@ -29,6 +29,14 @@
 // @connect      linovelib.com
 // @connect      baidu.com
 // @connect      pcs.baidu.com
+// OneDrive（微软 Graph API + OAuth2 设备码登录；上传到你自己的 OneDrive）
+// @connect      graph.microsoft.com
+// @connect      login.microsoftonline.com
+// @connect      login.microsoft.com
+// @connect      login.live.com
+// @connect      onedrive.com
+// @connect      1drv.com
+// @connect      sharepoint.com
 // @run-at       document-idle
 // @updateURL    https://raw.githubusercontent.com/zhtinist/Bilimanga-Downloader/main/userscript/bilimanga.user.js
 // @downloadURL  https://raw.githubusercontent.com/zhtinist/Bilimanga-Downloader/main/userscript/bilimanga.user.js
@@ -1315,6 +1323,146 @@
   }
 
   // 统一保存出口：按面板选择存本地或传网盘。
+  // ===================== OneDrive（微软 Graph API + OAuth2 设备码登录）=====================
+  // 每个用户登录自己的微软账号、传到自己的 OneDrive。client_id 是「应用身份」（公开，不含
+  // 凭证），默认用微软公共 App（零注册）；可在面板填自己注册的覆盖。登录凭证(refresh_token)
+  // 只存本地 GM 存储。详见 docs/onedrive.md。
+  const OD_DEFAULT_CLIENT_ID = "14d82eec-204b-4c2f-b7e8-296a70dab67e";
+  const OD_DOC_URL = "https://github.com/zhtinist/Bilimanga-Downloader/blob/main/docs/onedrive.md";
+  const OD_AUTHORITY = "https://login.microsoftonline.com/common/oauth2/v2.0";
+  const OD_GRAPH = "https://graph.microsoft.com/v1.0";
+  const OD_SCOPE = "offline_access Files.ReadWrite User.Read";
+  const OD_CHUNK = 10 * 1024 * 1024;    // 分片必须是 320KiB 整数倍
+  const OD_K = { cid: "bmd_od_client_id", refresh: "bmd_od_refresh", account: "bmd_od_account", base: "bmd_od_base" };
+
+  function odGet(k, d) { try { return typeof GM_getValue === "function" ? GM_getValue(k, d) : d; } catch (e) { return d; } }
+  function odSet(k, v) { try { if (typeof GM_setValue === "function") GM_setValue(k, v); } catch (e) {} }
+  function odClientId() { return odGet(OD_K.cid, "") || OD_DEFAULT_CLIENT_ID; }
+  function odBase() { return odGet(OD_K.base, "/bilidownloader") || "/bilidownloader"; }
+  function odRemotePath(book, filename) {
+    const cat = book.kind === "novel" ? "小说" : "漫画";
+    let base = odBase().replace(/\/+$/, ""); if (!base.startsWith("/")) base = "/" + base;
+    return `${base}/${cat}/${safeName(book.title)}/${filename}`;
+  }
+
+  // 用 refresh_token 换 access_token（轮换则回存）。返回 token 或 null。
+  async function odAccessToken() {
+    const refresh = odGet(OD_K.refresh, "");
+    if (!refresh) return null;
+    try {
+      const r = JSON.parse((await gmReq({
+        method: "POST", url: OD_AUTHORITY + "/token",
+        headers: { "Content-Type": "application/x-www-form-urlencoded" },
+        data: formBody({ client_id: odClientId(), grant_type: "refresh_token", refresh_token: refresh, scope: OD_SCOPE }),
+      })).responseText);
+      if (r.access_token) {
+        if (r.refresh_token) odSet(OD_K.refresh, r.refresh_token);
+        return r.access_token;
+      }
+    } catch (e) {}
+    return null;
+  }
+
+  // 校验并取账号名。返回名字或 null。
+  async function odVerify() {
+    const tok = await odAccessToken();
+    if (!tok) return null;
+    try {
+      const r = JSON.parse((await gmReq({ method: "GET", url: OD_GRAPH + "/me", headers: { Authorization: "Bearer " + tok } })).responseText);
+      const name = r.displayName || r.userPrincipalName || r.mail;
+      if (name) { odSet(OD_K.account, name); return name; }
+    } catch (e) {}
+    return null;
+  }
+
+  // 设备码登录：onStatus 回传「打开网址+验证码」提示；成功存 refresh_token，返回账号名或 null。
+  async function odDeviceLogin(onStatus) {
+    const say = (m) => onStatus && onStatus(m);
+    let dc;
+    try {
+      dc = JSON.parse((await gmReq({
+        method: "POST", url: OD_AUTHORITY + "/devicecode",
+        headers: { "Content-Type": "application/x-www-form-urlencoded" },
+        data: formBody({ client_id: odClientId(), scope: OD_SCOPE }),
+      })).responseText);
+    } catch (e) { say("发起登录失败：" + e.message); return null; }
+    if (!dc.device_code) { say("发起登录被拒：" + (dc.error_description || dc.error)); return null; }
+    const uri = dc.verification_uri || "https://microsoft.com/devicelogin";
+    say(`打开 ${uri} 输入验证码 ${dc.user_code}（登录你的微软账号并同意）`);
+    let interval = dc.interval || 5;
+    const deadline = Date.now() + (dc.expires_in || 900) * 1000;
+    while (Date.now() < deadline) {
+      await sleep(interval * 1000);
+      let tok;
+      try {
+        tok = JSON.parse((await gmReq({
+          method: "POST", url: OD_AUTHORITY + "/token",
+          headers: { "Content-Type": "application/x-www-form-urlencoded" },
+          data: formBody({ client_id: odClientId(), grant_type: "urn:ietf:params:oauth:grant-type:device_code", device_code: dc.device_code }),
+        })).responseText);
+      } catch (e) { continue; }
+      if (tok.access_token) {
+        if (tok.refresh_token) odSet(OD_K.refresh, tok.refresh_token);
+        return (await odVerify()) || "OneDrive 用户";
+      }
+      if (tok.error === "authorization_pending") continue;
+      if (tok.error === "slow_down") { interval += 5; continue; }
+      say("登录未完成：" + (tok.error_description || tok.error));
+      return null;
+    }
+    say("登录超时。");
+    return null;
+  }
+
+  // 上传：小文件直接 PUT；大文件 createUploadSession + 分片 PUT。
+  async function odUpload(bytes, remotePath, prog) {
+    const tok = await odAccessToken();
+    if (!tok) throw new Error("OneDrive 未登录：请先在面板连接 OneDrive");
+    const enc = remotePath.split("/").filter(Boolean).map(encodeURIComponent).join("/");
+    const size = bytes.length;
+    if (size < 4 * 1024 * 1024) {
+      const r = await gmReq({
+        method: "PUT", url: `${OD_GRAPH}/me/drive/root:/${enc}:/content`,
+        headers: { Authorization: "Bearer " + tok, "Content-Type": "application/octet-stream" },
+        data: new Blob([bytes]),
+      });
+      if (r.status === 200 || r.status === 201) return remotePath;
+      throw new Error("OneDrive 上传失败 HTTP " + r.status);
+    }
+    const sess = JSON.parse((await gmReq({
+      method: "POST", url: `${OD_GRAPH}/me/drive/root:/${enc}:/createUploadSession`,
+      headers: { Authorization: "Bearer " + tok, "Content-Type": "application/json" },
+      data: JSON.stringify({ item: { "@microsoft.graph.conflictBehavior": "replace" } }),
+    })).responseText);
+    const uploadUrl = sess.uploadUrl;
+    if (!uploadUrl) throw new Error("OneDrive 创建上传会话失败");
+    const nchunks = Math.ceil(size / OD_CHUNK);
+    let start = 0;
+    for (let idx = 0; start < size; idx++) {
+      const end = Math.min(size, start + OD_CHUNK);
+      const chunk = bytes.subarray(start, end);
+      dlog("OneDrive 传块", (idx + 1) + "/" + nchunks);
+      let ok = false;
+      for (let attempt = 0; attempt < 4 && !ok; attempt++) {
+        try {
+          const r = await gmReq({
+            method: "PUT", url: uploadUrl,
+            headers: { "Content-Range": `bytes ${start}-${end - 1}/${size}` },
+            data: new Blob([chunk]),
+          });
+          if ([200, 201, 202].includes(r.status)) ok = true;
+          else if (attempt === 3) throw new Error("分片 HTTP " + r.status);
+          else await sleep(1500 * (attempt + 1));
+        } catch (e) { if (attempt === 3) throw e; await sleep(1500 * (attempt + 1)); }
+      }
+      prog.setRatio(end / size);
+      prog.setState(`上传 OneDrive ${idx + 1}/${nchunks} 块`);
+      start = end;
+    }
+    return remotePath;
+  }
+
+  // 统一保存出口：按面板选择存本地 / 百度 / OneDrive。
   async function dispatchSave(book, bytes, filename, ext, prog) {
     if (saveTarget === "baidu") {
       const remote = baiduRemotePath(book, filename);
@@ -1323,6 +1471,13 @@
       await baiduUpload(bytes, remote, prog);
       dlog("保存 网盘完成", remote);
       prog.setState("已上传网盘 ☁");
+    } else if (saveTarget === "onedrive") {
+      const remote = odRemotePath(book, filename);
+      dlog("保存 → OneDrive", remote, "字节=" + bytes.length);
+      prog.setState("上传 OneDrive…");
+      await odUpload(bytes, remote, prog);
+      dlog("保存 OneDrive 完成", remote);
+      prog.setState("已上传 OneDrive ☁");
     } else {
       dlog("保存 → 本地", filename, "字节=" + bytes.length);
       saveFile(bytes, filename, ext);
@@ -1548,11 +1703,21 @@
         <span style="color:#888">保存到：</span>
         <label><input type="radio" name="bmd-dest" value="local" checked> 💾 本地</label>
         <label><input type="radio" name="bmd-dest" value="baidu"> ☁ 百度网盘</label>
-        <span id="bmd-baidu-status" style="font-size:12px;color:#888"></span>
+        <label><input type="radio" name="bmd-dest" value="onedrive"> ☁ OneDrive</label>
       </div>
       <div class="bmd-row bmd-hidden" id="bmd-baidu-row">
+        <span id="bmd-baidu-status" style="font-size:12px;color:#888"></span>
         <span style="color:#888;white-space:nowrap">网盘根路径</span>
-        <input type="text" id="bmd-baidu-base" placeholder="/bilidownloader" />
+        <input type="text" id="bmd-baidu-base" placeholder="/bilidownloader" style="flex:1;min-width:100px" />
+      </div>
+      <div class="bmd-row bmd-hidden" id="bmd-od-row">
+        <span id="bmd-od-status" style="font-size:12px;color:#888">检测登录…</span>
+        <button class="bmd-btn" id="bmd-od-connect">连接 OneDrive</button>
+        <a href="${OD_DOC_URL}" target="_blank" style="font-size:12px">配置教程</a>
+      </div>
+      <div class="bmd-row bmd-hidden" id="bmd-od-cfg">
+        <span style="color:#888;white-space:nowrap">根路径</span>
+        <input type="text" id="bmd-od-base" placeholder="/bilidownloader" style="flex:1;min-width:100px" />
       </div>
       <div class="bmd-row">
         <label title="勾选后开始记录每次请求/每章/每张图，卡住时也能定位">
@@ -1580,6 +1745,28 @@
       baseInput.value = v;
       setBaiduBase(v);
     });
+    // OneDrive：根路径 + 连接（设备码登录，弹出验证码提示在 hint 区）。
+    const odBaseInput = panel.querySelector("#bmd-od-base");
+    odBaseInput.value = odBase();
+    odBaseInput.addEventListener("change", () => {
+      let v = (odBaseInput.value || "").trim() || "/bilidownloader";
+      if (!v.startsWith("/")) v = "/" + v;
+      odBaseInput.value = v;
+      odSet(OD_K.base, v);
+    });
+    panel.querySelector("#bmd-od-connect").addEventListener("click", async (e) => {
+      const btn = e.target;
+      btn.disabled = true;
+      try {
+        const name = await odDeviceLogin((m) => setHint(m));
+        if (name) {
+          setHint("✓ 已连接 OneDrive：" + name);
+          await odRefreshStatus();
+        }
+      } finally {
+        btn.disabled = false;
+      }
+    });
     // 调试日志：勾选即开始记录；「下载日志」按钮随时把 log.txt 下到浏览器下载目录。
     panel.querySelector("#bmd-debug").addEventListener("change", (e) => {
       if (e.target.checked) {
@@ -1596,28 +1783,53 @@
     });
   }
 
-  // 选择「百度网盘」时校验登录态：已登录显示昵称并展开根路径；未登录回退本地。
+  // 选择网盘时校验登录态：百度看浏览器 cookie；OneDrive 看本地 refresh_token。
   async function onDestChange() {
     const dest = panel.querySelector('input[name="bmd-dest"]:checked').value;
-    const baseRow = panel.querySelector("#bmd-baidu-row");
-    const statusEl = panel.querySelector("#bmd-baidu-status");
-    if (dest !== "baidu") {
-      baseRow.classList.add("bmd-hidden");
-      statusEl.textContent = "";
-      return;
+    const baiduRow = panel.querySelector("#bmd-baidu-row");
+    const odRow = panel.querySelector("#bmd-od-row");
+    const odCfg = panel.querySelector("#bmd-od-cfg");
+    baiduRow.classList.add("bmd-hidden");
+    odRow.classList.add("bmd-hidden");
+    odCfg.classList.add("bmd-hidden");
+
+    if (dest === "baidu") {
+      const statusEl = panel.querySelector("#bmd-baidu-status");
+      baiduRow.classList.remove("bmd-hidden");
+      statusEl.style.color = "#888";
+      statusEl.textContent = "检测登录…";
+      const info = await baiduVerify();
+      if (info) {
+        statusEl.style.color = "#2e7d32";
+        statusEl.textContent = "已登录：" + info.nickname;
+      } else {
+        statusEl.style.color = "#c62828";
+        statusEl.textContent = "未登录 pan.baidu.com";
+        panel.querySelector('input[name="bmd-dest"][value="local"]').checked = true;
+        baiduRow.classList.add("bmd-hidden");
+      }
+    } else if (dest === "onedrive") {
+      odRow.classList.remove("bmd-hidden");
+      odCfg.classList.remove("bmd-hidden");
+      await odRefreshStatus();
     }
-    statusEl.style.color = "#888";
-    statusEl.textContent = "检测登录…";
-    const info = await baiduVerify();
-    if (info) {
-      statusEl.style.color = "#2e7d32";
-      statusEl.textContent = "已登录：" + info.nickname;
-      baseRow.classList.remove("bmd-hidden");
+  }
+
+  // 刷新 OneDrive 登录状态显示（已登录显示账号名 + 隐藏连接按钮）。
+  async function odRefreshStatus() {
+    const st = panel.querySelector("#bmd-od-status");
+    const btn = panel.querySelector("#bmd-od-connect");
+    st.style.color = "#888";
+    st.textContent = "检测登录…";
+    const name = await odVerify();
+    if (name) {
+      st.style.color = "#2e7d32";
+      st.textContent = "已登录：" + name;
+      btn.textContent = "重新登录";
     } else {
-      statusEl.style.color = "#c62828";
-      statusEl.textContent = "未登录，请先在浏览器登录 pan.baidu.com 后再试";
-      panel.querySelector('input[name="bmd-dest"][value="local"]').checked = true;
-      baseRow.classList.add("bmd-hidden");
+      st.style.color = "#c62828";
+      st.textContent = "未连接";
+      btn.textContent = "连接 OneDrive";
     }
   }
 
@@ -1718,6 +1930,14 @@
       let v = (panel.querySelector("#bmd-baidu-base").value || "").trim() || "/bilidownloader";
       if (!v.startsWith("/")) v = "/" + v;
       setBaiduBase(v);
+    } else if (saveTarget === "onedrive") {
+      let v = (panel.querySelector("#bmd-od-base").value || "").trim() || "/bilidownloader";
+      if (!v.startsWith("/")) v = "/" + v;
+      odSet(OD_K.base, v);
+      if (!odGet(OD_K.refresh, "")) {
+        setHint("尚未连接 OneDrive：请先点「连接 OneDrive」登录。");
+        return;
+      }
     }
     // 调试日志：勾选则本次下载从头记录一份新日志（点「⬇ 下载日志」随时导出）。
     DBG = panel.querySelector("#bmd-debug").checked;

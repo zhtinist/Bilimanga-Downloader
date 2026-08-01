@@ -80,6 +80,26 @@ def open_settings(config: Config, use_terminal: bool = True) -> None:
     else:
         print("百度网盘：未连接（回主界面输入 c 连接账号）")
 
+    # OneDrive
+    if config.onedrive_refresh_token:
+        print(f"OneDrive：已连接（{config.onedrive_account or '微软账号'}）")
+        v = input(f"OneDrive 上传根路径 [{config.onedrive_upload_base}]: ").strip()
+        if v:
+            config.onedrive_upload_base = v if v.startswith("/") else "/" + v
+        v = input("断开 OneDrive？输入 yes 断开（清除本地登录态）: ").strip().lower()
+        if v == "yes":
+            config.onedrive_refresh_token = ""
+            config.onedrive_account = ""
+            print("  已断开 OneDrive。")
+    else:
+        print("OneDrive：未连接（回主界面输入 o 连接账号）")
+    cur_cid = config.onedrive_client_id or "内置公共应用（零注册，直接登录即可）"
+    v = input(f"OneDrive client_id [{cur_cid}]（进阶：填你自注册应用的 id；输入 none 清空用内置）: ").strip()
+    if v.lower() == "none":
+        config.onedrive_client_id = ""
+    elif v:
+        config.onedrive_client_id = v
+
     config.save()
     print("设置已保存。")
     print(f"文件将保存到：{config.output_path()}")

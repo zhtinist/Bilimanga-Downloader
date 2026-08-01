@@ -145,6 +145,7 @@ class _Shared:
         self._net: Optional[Net] = None
         self._sources: dict = {}       # kind -> Source 实例（会话/引擎跨本复用）
         self._baidu: Optional[tuple] = None   # (connected, nickname) 缓存
+        self._onedrive: Optional[tuple] = None  # (connected, account) 缓存
 
     def ensure_net(self) -> Net:
         if self._net is None:
@@ -159,10 +160,13 @@ class _Shared:
         return self._sources[kind]
 
     def storage(self, target: str = "local"):
-        """按去向返回存储插件：baidu（已连接时）或本地。"""
+        """按去向返回存储插件：baidu / onedrive（已连接时）或本地。"""
         if target == "baidu" and self.config.baidu_cookie:
             from ..storage.baidu import BaiduStorage
             return BaiduStorage(self.config)
+        if target == "onedrive" and self.config.onedrive_refresh_token:
+            from ..storage.onedrive import OneDriveStorage
+            return OneDriveStorage(self.config)
         from ..storage.local import LocalStorage
         return LocalStorage(self.config.output_path())
 
@@ -194,6 +198,43 @@ class _Shared:
             self.config.save()
             self._baidu = (True, nick)
             desktop_notify("百度云已连接", f"账号：{nick}，之后可上传到网盘。")
+            return True
+        return False
+
+    def onedrive_status(self) -> tuple:
+        """(是否已连接, 账号名)。启动/首次访问时用 refresh_token 校验一次，失效则清缓存。"""
+        if self._onedrive is None:
+            if self.config.onedrive_refresh_token:
+                from ..storage.onedrive import OneDriveClient
+                cli = OneDriveClient(self.config.onedrive_client_id,
+                                     self.config.onedrive_refresh_token)
+                acct = cli.verify()
+                if acct:
+                    # 令牌可能轮换，写回
+                    if cli.refresh_token != self.config.onedrive_refresh_token:
+                        self.config.onedrive_refresh_token = cli.refresh_token
+                    if acct != self.config.onedrive_account:
+                        self.config.onedrive_account = acct
+                    self.config.save()
+                    self._onedrive = (True, acct)
+                else:
+                    self._onedrive = (False, None)
+            else:
+                self._onedrive = (False, None)
+        return self._onedrive
+
+    def connect_onedrive(self) -> bool:
+        """设备码登录 OneDrive：打印网址+验证码，用户在浏览器登录并同意；成功保存。"""
+        from ..storage.onedrive import device_code_login, desktop_notify
+        refresh, acct = device_code_login(
+            self.config.onedrive_client_id,
+            on_status=lambda m: _print(f"  [bold yellow]{m}[/bold yellow]"))
+        if refresh and acct:
+            self.config.onedrive_refresh_token = refresh
+            self.config.onedrive_account = acct
+            self.config.save()
+            self._onedrive = (True, acct)
+            desktop_notify("OneDrive 已连接", f"账号：{acct}，之后可上传到 OneDrive。")
             return True
         return False
 
@@ -279,10 +320,15 @@ def _step_input(st: _State) -> str:
     _print("  轻小说 https://www.bilinovel.com/novel/2139.html")
     connected, nick = st.shared.baidu_status()
     if connected:
-        _print(f"[green]☁ 百度云：{nick}[/green]（下载时可选存本地 / 上传网盘）")
+        _print(f"[green]☁ 百度云：{nick}[/green]")
     else:
-        _print("[grey37]☁ 百度云：未连接[/grey37]（下载只能存本地；输入 c 连接）")
-    _print("[dim]s=设置   c=连接百度云   q=退出[/dim]")
+        _print("[grey37]☁ 百度云：未连接[/grey37]（输入 c 连接）")
+    od_conn, od_acct = st.shared.onedrive_status()
+    if od_conn:
+        _print(f"[green]☁ OneDrive：{od_acct}[/green]")
+    else:
+        _print("[grey37]☁ OneDrive：未连接[/grey37]（输入 o 连接）")
+    _print("[dim]s=设置   c=连接百度云   o=连接OneDrive   q=退出[/dim]")
     raw = _ask_text("→ 网址或书号：")
     if raw is None:
         st.exit_app = True
@@ -303,6 +349,24 @@ def _step_input(st: _State) -> str:
             _print("即将打开浏览器，请在弹出窗口登录百度账号（登录后自动检测）……")
             ok = st.shared.connect_baidu()
             _print(f"[green]✓ 已连接：{st.shared.baidu_status()[1]}[/green]" if ok
+                   else "[yellow]未完成登录（超时/取消）。[/yellow]")
+        _pause("\n按回车返回……")
+        return GO_BACK
+    if raw.lower() in ("o", "onedrive", "od"):
+        if st.shared.onedrive_status()[0]:
+            _print(f"[green]已连接 OneDrive：{st.shared.onedrive_status()[1]}[/green]"
+                   "（如需换号，可到设置里断开后重连）")
+        else:
+            from ..storage.onedrive import DOC_URL
+            _print(f"[cyan]配置/连接教程：{DOC_URL}[/cyan]（已尝试在浏览器打开）")
+            try:
+                import webbrowser
+                webbrowser.open(DOC_URL)
+            except Exception:  # noqa: BLE001
+                pass
+            _print("即将开始 OneDrive 登录，请按提示在浏览器打开网址、输入验证码并登录微软账号……")
+            ok = st.shared.connect_onedrive()
+            _print(f"[green]✓ 已连接：{st.shared.onedrive_status()[1]}[/green]" if ok
                    else "[yellow]未完成登录（超时/取消）。[/yellow]")
         _pause("\n按回车返回……")
         return GO_BACK
@@ -390,19 +454,23 @@ def _step_format(st: _State) -> str:
 def _step_download(st: _State) -> str:
     _clear()
     _breadcrumb(4, "轻小说" if st.is_novel else "漫画")
-    # 选择保存去向：已连接百度云才可选网盘；否则强制本地。
+    # 选择保存去向：本地 + 已连接的网盘（百度 / OneDrive）。只有本地时不弹选择。
     target = "local"
-    connected, nick = st.shared.baidu_status()
-    if connected:
-        choice = _ask_select(
-            "保存到哪里？（↑↓ 选择）",
-            [f"💾 本地（{st.config.output_path()}）",
-             f"☁ 百度网盘（{nick}）", "← 返回上一步"])
+    options = [(f"💾 本地（{st.config.output_path()}）", "local")]
+    b_conn, b_nick = st.shared.baidu_status()
+    if b_conn:
+        options.append((f"☁ 百度网盘（{b_nick}）", "baidu"))
+    o_conn, o_acct = st.shared.onedrive_status()
+    if o_conn:
+        options.append((f"☁ OneDrive（{o_acct}）", "onedrive"))
+    if len(options) > 1:
+        labels = [o[0] for o in options] + ["← 返回上一步"]
+        choice = _ask_select("保存到哪里？（↑↓ 选择）", labels)
         if choice is None:
             return QUIT
         if choice.startswith("←"):
             return GO_BACK
-        target = "baidu" if choice.startswith("☁") else "local"
+        target = next((t for lbl, t in options if lbl == choice), "local")
     storage = st.shared.storage(target)
     _print(f"保存去向：[bold]{storage.status_label()}[/bold]\n")
     index_map = {v.index: v for v in st.book.volumes}
