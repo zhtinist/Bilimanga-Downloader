@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Bilimanga 漫画/轻小说下载器
 // @namespace    https://github.com/zhtinist/Bilimanga-Downloader
-// @version      2.0.0
-// @description  在 bilimanga 漫画 / linovelib 轻小说页面里一键把整卷下载成 EPUB / PDF。
+// @version      2.1.0
+// @description  在 bilimanga 漫画 / 哔哩轻小说(bilinovel) 页面里一键把整卷下载成 EPUB / PDF。
 // @author       HTZHU
 // @license      MIT
 // @homepageURL  https://github.com/zhtinist/Bilimanga-Downloader
@@ -10,8 +10,9 @@
 // @icon         https://www.bilimanga.net/favicon.ico
 // @match        https://www.bilimanga.net/*
 // @match        https://www.bilicomic.net/*
+// @match        https://www.bilinovel.com/*
+// @match        https://m.bilinovel.com/*
 // @match        https://www.linovelib.com/*
-// @require      https://raw.githubusercontent.com/zhtinist/Bilimanga-Downloader/main/userscript/rubbish_secret_map.js
 // @grant        GM_download
 // @grant        GM_xmlhttpRequest
 // @grant        GM_addStyle
@@ -136,14 +137,75 @@
     return !html || CF_CHALLENGE.some((m) => html.includes(m));
   }
 
-  async function fetchText(url) {
-    const resp = await fetchWithTimeout(url, { credentials: "include" }, 20000);
-    const html = await resp.text();
-    if (isChallenge(html)) {
-      throw new Error("页面被 Cloudflare 拦截，请在当前标签手动通过人机验证后重试。");
+  // 软限流占位页特征（429 或站点返回的“审核未通过/需要权限”页）。
+  const RATE_MARKERS = [
+    "需要足夠的權限", "需要足够的权限", "審核未通過", "审核未通过",
+    "沒有可閱讀的章節內容", "没有可阅读的章节内容",
+  ];
+  function isRateLimited(status, html) {
+    return status === 429 || (!!html && RATE_MARKERS.some((m) => html.includes(m)));
+  }
+
+  // 限流闸门（照搬命令行版 RateGate）：正文/页面请求串行 + 最小间隔，命中限流即
+  // 让**全体**请求一起冷却并自适应拉长间隔；图片请求只等冷却、不串行。
+  // 浏览器里本就带真实指纹+cookie（不必过 CF），这里唯一要防的就是按 IP 的 429。
+  const gate = (() => {
+    let busy = false, nextAt = 0, cooldownUntil = 0, minGap = 250;
+    const BASEGAP = 250, MAXGAP = 6000;
+    async function acquire() {          // 正文/页面：串行 + 间隔 + 冷却
+      while (busy) await sleep(25);
+      busy = true;
+      let wait;
+      while ((wait = Math.max(nextAt - Date.now(), cooldownUntil - Date.now())) > 0) {
+        await sleep(Math.min(wait, 1000));
+      }
+      nextAt = Date.now() + minGap;
     }
-    if (!resp.ok) throw new Error(`HTTP ${resp.status}：${url}`);
-    return html;
+    function release() { busy = false; }
+    function penalize(sec) {            // 命中限流：全体冷却 + 拉长间隔
+      cooldownUntil = Math.max(cooldownUntil, Date.now() + sec * 1000);
+      minGap = Math.min(minGap * 1.5 + 100, MAXGAP);
+    }
+    function reward() { if (minGap > BASEGAP) minGap = Math.max(BASEGAP, minGap * 0.9); }
+    async function waitCooldown() {     // 图片：只等全局冷却，不串行
+      let wait;
+      while ((wait = cooldownUntil - Date.now()) > 0) await sleep(Math.min(wait, 1000));
+    }
+    return { acquire, release, penalize, reward, waitCooldown };
+  })();
+
+  // 页面抓取：走限流闸门；命中 429/占位页则全体冷却后重试；真 CF 质询交用户手动过。
+  async function fetchText(url, tries = 8) {
+    let lastErr = null;
+    for (let attempt = 0; attempt < tries; attempt++) {
+      await gate.acquire();
+      let status = 0, html = "";
+      try {
+        const resp = await fetchWithTimeout(url, { credentials: "include" }, 20000);
+        status = resp.status;
+        html = await resp.text();
+      } catch (e) {
+        lastErr = e;
+      } finally {
+        gate.release();
+      }
+      if (status === 200) {
+        if (CF_CHALLENGE.some((m) => html.includes(m))) {
+          throw new Error("页面被 Cloudflare 拦截，请在当前标签手动通过人机验证后重试。");
+        }
+        if (html && !isRateLimited(status, html)) {
+          gate.reward();
+          return html;
+        }
+      }
+      // 429 / 占位限流 / 空响应：全体冷却后重试；其它 HTTP 错误指数退避。
+      if (isRateLimited(status, html) || !html) {
+        gate.penalize(Math.min(15 + attempt * 8, 45));
+      } else {
+        await sleep(Math.min(1500 * Math.pow(2, attempt), 10000));
+      }
+    }
+    throw lastErr || new Error(`多次抓取失败（限流未恢复）：${url}`);
   }
 
   function parseDoc(html) {
@@ -219,59 +281,38 @@
   }
 
   // ===================================================================
-  // 二·B、轻小说（linovelib）解析 —— 与命令行版 novel.py 逻辑一致
+  // 二·B、轻小说（哔哩轻小说 手机站 bilinovel）解析 —— 与命令行版 novel_mobile.py 一致。
+  // 手机站正文干净（无 PUA 字体混淆）：阅读页取 #acontent 内的 <p> 与 <img data-src>。
   // ===================================================================
-  const NOVEL_IMG_HOST = "https://img3.readpai.com";
-  const NOVEL_PUNCT = "，。！？、；：“”‘’（）《》〈〉【】『』〖〗…—～＋－＝×÷·「」　 ";
-
   function isNovelPath() {
     return /\/novel\/\d+/.test(location.pathname);
   }
 
-  function deobfuscateLastP(bodyHtml) {
-    const map = window.RUBBISH_MAP || {};
-    const doc = parseDoc(`<div id="__w">${bodyHtml}</div>`);
-    const ps = Array.from(doc.querySelectorAll("p"));
-    if (!ps.length) return bodyHtml;
-    let target = null;
-    for (let i = ps.length - 1; i >= Math.max(ps.length - 11, 0); i--) {
-      if (ps[i].textContent.trim()) { target = ps[i]; break; }
-    }
-    if (!target) return bodyHtml;
-    let out = "";
-    for (const ch of target.textContent) {
-      if (map[ch] !== undefined) out += map[ch];
-      else if (NOVEL_PUNCT.includes(ch)) out += ch;
-    }
-    target.textContent = out;
-    return doc.querySelector("#__w").innerHTML;
-  }
-
   function pageTextNovel(html) {
-    const obf = html.includes("woff2");
     const doc = parseDoc(html);
-    const content = doc.querySelector("#TextContent");
+    const content = doc.querySelector("#acontent") || doc.querySelector(".bcontent");
     if (!content) return "";
-    content.querySelectorAll("#show-more-images,#hidden-images,.google-auto-placed,.ap_container,.dag")
-      .forEach((e) => e.remove());
-    let textHtml = content.innerHTML.replace(/<!--[\s\S]*?-->/g, "");
-    // 插图 → 占位标记（真实 URL），稍后统一编号
-    textHtml = textHtml.replace(/<img\s[^>]*>/g, (tag) => {
-      const m = tag.match(/[a-zA-Z]{3}\/(.*?)\.(jpg|png|jpeg)/);
-      if (!m) return "";
-      return `<img class="__nv__" src="${NOVEL_IMG_HOST}/${m[1]}.${m[2]}"/>`;
+    // 丢弃诱饵/装饰节点：类名形如 [a-z]\d{4} 的元素，以及非 p/img 的直接子节点。
+    content.querySelectorAll("[class]").forEach((el) => {
+      const cls = (el.getAttribute("class") || "").trim();
+      if (/^[a-z]\d{4}$/.test(cls)) el.remove();
     });
-    const c2 = parseDoc(`<div id="TextContent">${textHtml}</div>`).querySelector("#TextContent");
-    const warn = c2.innerHTML.match(/<p(\d+)>/);
-    if (warn) { const el = c2.querySelector("p" + warn[1]); if (el) el.remove(); }
-    let body = c2.innerHTML.replace(/^\n+/, "").replace(/\n+$/, "");
-    const cut = body.indexOf("————————————以下为告示");
-    if (cut !== -1) {
-      const lt = body.lastIndexOf("<", cut);
-      body = body.slice(0, lt !== -1 ? lt : cut);
-    }
-    if (obf) body = deobfuscateLastP(body);
-    return body;
+    Array.from(content.children).forEach((el) => {
+      const tag = el.tagName.toLowerCase();
+      if (tag !== "p" && tag !== "img") el.remove();
+    });
+    const out = [];
+    content.querySelectorAll("p, img").forEach((node) => {
+      if (node.tagName.toLowerCase() === "img") {
+        const src = node.getAttribute("data-src") || node.getAttribute("src") || "";
+        if (!src || src.includes("<")) return;
+        out.push('<img class="__nv__" src="' + absUrl(src, location.origin) + '"/>');
+      } else {
+        const t = (node.textContent || "").trim();
+        if (t) out.push("<p>" + escHtml(t) + "</p>");
+      }
+    });
+    return out.join("\n");
   }
 
   async function fetchChapterTextNovel(chapUrl, base) {
@@ -279,57 +320,55 @@
     while (true) {
       const html = await fetchText(url);
       text += pageTextNovel(html);
-      const nxt = chapUrl.replace(".html", `_${page + 1}.html`).slice(base.length);
-      if (html.includes(nxt)) { page += 1; url = base + nxt; await sleep(300); }
+      const nxt = chapUrl.replace(".html", "_" + (page + 1) + ".html").slice(base.length);
+      if (html.includes(nxt)) { page += 1; url = base + nxt; }
       else break;
     }
     return text;
   }
 
   async function fetchCatalogNovel(bookNo, base) {
-    const html = await fetchText(`${base}/novel/${bookNo}/catalog`);
+    const html = await fetchText(base + "/novel/" + bookNo + "/catalog");
     const doc = parseDoc(html);
     const volumes = [];
-    doc.querySelectorAll("div.volume.clearfix").forEach((v, i) => {
-      const title = textOf(v.querySelector("h2.v-line")) || `第${i + 1}卷`;
-      const chapters = [];
-      v.querySelectorAll("li.col-4").forEach((li) => {
+    let cur = null, idx = 0;
+    doc.querySelectorAll(".volume-chapters > li").forEach((li) => {
+      const cls = li.className || "";
+      if (cls.includes("chapter-bar")) {
+        idx += 1;
+        cur = { index: idx, title: (li.textContent || "").trim() || ("第" + idx + "卷"), chapters: [] };
+        volumes.push(cur);
+        return;
+      }
+      if (cls.includes("volume-cover")) return;
+      if (cls.includes("jsChapter")) {
+        if (!cur) { idx += 1; cur = { index: idx, title: "", chapters: [] }; volumes.push(cur); }
         const a = li.querySelector("a");
         if (!a) return;
         const href = a.getAttribute("href") || "";
-        if (href.includes("javascript") || !href.trim()) return;
-        chapters.push({ title: textOf(li) || textOf(a), url: absUrl(href, base) });
-      });
-      volumes.push({ index: i + 1, title, chapters });
+        const url = href.includes("javascript") ? "" : absUrl(href, base);
+        cur.chapters.push({ title: (li.textContent || "").trim() || textOf(a), url });
+      }
     });
-    return volumes;
+    return volumes.filter((v) => v.chapters.length);
   }
 
   async function fetchBookNovel(bookNo, base) {
-    const html = await fetchText(`${base}/novel/${bookNo}.html`);
+    const html = await fetchText(base + "/novel/" + bookNo + ".html");
     const doc = parseDoc(html);
     const meta = (p) => {
-      const m = doc.querySelector(`meta[property="${p}"]`);
+      const m = doc.querySelector('meta[property="' + p + '"]');
       return m && m.getAttribute("content") ? m.getAttribute("content").trim() : "";
     };
-    const title = meta("og:novel:book_name") || textOf(doc.querySelector("h1"));
-    const author = meta("og:novel:author") || "未知作者";
-    let publisher = "", tags = [];
-    const label = doc.querySelector("div.book-label");
-    if (label) {
-      publisher = textOf(label.querySelector("a.label"));
-      const span = label.querySelector("span");
-      if (span) tags = Array.from(span.querySelectorAll("a")).map((a) => textOf(a)).filter(Boolean);
-    }
-    let summary = "";
-    const dec = doc.querySelector("div.book-dec") || doc.querySelector(".book-dec");
-    if (dec) { const p = dec.querySelector("p"); summary = p ? textOf(p) : textOf(dec); }
-    let coverUrl = "";
-    const bi = doc.querySelector("div.book-img img") || doc.querySelector(".book-img img");
-    if (bi) coverUrl = bi.getAttribute("src") || "";
+    const title = textOf(doc.querySelector(".book-title")) || meta("og:novel:book_name") || ("未知(" + bookNo + ")");
+    const author = textOf(doc.querySelector(".book-rand-a span")) || meta("og:novel:author") || "未知作者";
+    const publisher = textOf(doc.querySelector(".tag-small.orange")) || meta("og:novel:category");
+    const summary = textOf(doc.querySelector("#bookSummary content")) || meta("og:description");
+    const tags = Array.from(doc.querySelectorAll(".book-cell .book-meta span em")).map((e) => textOf(e)).filter(Boolean);
+    const coverEl = doc.querySelector(".book-layout img") || doc.querySelector(".book-img img");
+    const coverUrl = coverEl ? absUrl(coverEl.getAttribute("src") || "", base) : "";
     const volumes = await fetchCatalogNovel(bookNo, base);
-    return { bookNo, base, kind: "novel", title: title || `未知(${bookNo})`,
-             author, publisher, summary, coverUrl, tags, volumes };
+    return { bookNo, base, kind: "novel", title, author, publisher, summary, coverUrl, tags, volumes };
   }
 
   function pad2(n) { return String(n).padStart(2, "0"); }
@@ -420,7 +459,8 @@
     const jobs = vol.chapters.map((c, i) => ({ c, i })).filter((j) => !j.c.url.includes("javascript"));
     const bodies = new Array(vol.chapters.length).fill("");
     let done = 0;
-    await runPool(jobs, 3, async ({ c, i }) => {
+    // 正文串行抓取（并发受 gate 控制；正文页对并发敏感，串行 + 429 冷却最稳）。
+    await runPool(jobs, 1, async ({ c, i }) => {
       try { bodies[i] = await fetchChapterTextNovel(c.url, book.base); }
       catch (e) { bodies[i] = ""; }
       done += 1;
@@ -450,7 +490,12 @@
     prog.setState(`下载插图 ${imgUrls.length} 张…`);
     const images = {};
     await runPool(imgUrls, IMAGE_CONCURRENCY, async (u) => {
-      try { images[imgMap[u]] = await fetchImageAsJpeg(u); } catch (e) {}
+      // 边下边补：单张就地重试 3 次，命中限流先等全局冷却。
+      for (let attempt = 0; attempt < 3; attempt++) {
+        await gate.waitCooldown();
+        try { images[imgMap[u]] = await fetchImageAsJpeg(u); return; }
+        catch (e) { if (attempt < 2) await sleep(500 * (attempt + 1)); }
+      }
     });
 
     prog.setState("打包中…");
@@ -1028,8 +1073,9 @@
 
       let done = 0;
       const fetchOne = async (t) => {
-        // 单张最多试 3 次（网络抖动/429 常是暂时性），失败留 null 由补漏轮兜底
+        // 单张最多试 3 次（网络抖动/429 常是暂时性）；命中限流先等全局冷却。
         for (let attempt = 0; attempt < 3; attempt++) {
+          await gate.waitCooldown();
           try {
             chapterData[t.ci].images[t.ii] = await fetchImageAsJpeg(t.url);
             return;
