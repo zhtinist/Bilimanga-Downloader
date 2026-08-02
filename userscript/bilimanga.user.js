@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Bilimanga 漫画/轻小说下载器
 // @namespace    https://github.com/zhtinist/Bilimanga-Downloader
-// @version      3.1.1
+// @version      3.1.2
 // @description  在 bilimanga 漫画 / 哔哩轻小说(bilinovel) 页面里一键把整卷下载成 EPUB / PDF，可存本地或上传到你的百度网盘。
 // @author       HTZHU
 // @license      MIT
@@ -57,8 +57,52 @@
   const textEncoder = new TextEncoder();
   const enc = (s) => textEncoder.encode(s);
 
+  // 后台标签页里浏览器会把 setTimeout 节流到 ≥1s（甚至冻结），下载全靠 sleep() 控节奏，
+  // 一到后台就被拖慢。用 Web Worker 里的定时器（不受后台节流），主线程只收它的消息事件
+  // （消息不被节流），从而在后台也保持正常速度。创建失败（如站点 CSP 拦 blob worker）则
+  // 回退普通 setTimeout。
+  const _timer = (() => {
+    try {
+      const code =
+        "var t={};onmessage=function(e){var d=e.data;" +
+        "if(d.a==='s'){t[d.id]=setTimeout(function(){postMessage(d.id);delete t[d.id];},d.ms);}" +
+        "else if(d.a==='c'){clearTimeout(t[d.id]);delete t[d.id];}};";
+      const w = new Worker(URL.createObjectURL(new Blob([code], { type: "application/javascript" })));
+      const cbs = {};
+      let seq = 0;
+      w.onmessage = (e) => { const cb = cbs[e.data]; if (cb) { delete cbs[e.data]; cb(); } };
+      return {
+        sleep: (ms) => new Promise((res) => { const id = ++seq; cbs[id] = res; w.postMessage({ a: "s", id, ms }); }),
+      };
+    } catch (e) { return null; }
+  })();
+
   function sleep(ms) {
+    if (_timer) return _timer.sleep(ms);
     return new Promise((r) => setTimeout(r, ms));
+  }
+
+  // 后台防冻结：下载期间播一段**静音**音频，让浏览器把本标签视为“正在播放”，从而不冻结、
+  // 少节流（标签会显示喇叭图标，属正常）。必须在用户手势内首次启动（onStart 里调用）。
+  let _keepAudio = null;
+  function keepAliveOn() {
+    try {
+      if (_keepAudio) return;
+      const Ctx = window.AudioContext || window.webkitAudioContext;
+      if (!Ctx) return;
+      const ctx = new Ctx();
+      const osc = ctx.createOscillator();
+      const gain = ctx.createGain();
+      gain.gain.value = 0;               // 完全静音
+      osc.connect(gain); gain.connect(ctx.destination);
+      osc.start();
+      _keepAudio = { ctx, osc };
+    } catch (e) {}
+  }
+  function keepAliveOff() {
+    try {
+      if (_keepAudio) { _keepAudio.osc.stop(); _keepAudio.ctx.close(); _keepAudio = null; }
+    } catch (e) {}
   }
 
   // 给任意 Promise 套一个总超时兜底：无论卡在网络、图片解码还是 canvas 编码，
@@ -1982,6 +2026,7 @@
     const progs = {};
     for (const vol of volumes) progs[vol.index] = createProgress(`${vol.index}. ${vol.title}`);
     downloading = true;
+    keepAliveOn();          // 防后台冻结/节流（静音音频，在此用户手势内启动）
     try {
       for (const vol of volumes) {
         const prog = progs[vol.index];
@@ -1999,6 +2044,7 @@
       }
     } finally {
       downloading = false;
+      keepAliveOff();
       panel.querySelector("#bmd-title").textContent = "下载完成";
       if (DBG) {
         dlog("=== 本次下载结束 ===");
