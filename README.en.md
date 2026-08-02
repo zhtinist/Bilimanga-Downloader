@@ -22,9 +22,9 @@ Two ways to use it:
    - Manga: `https://www.bilimanga.net/detail/703.html`
    - Novel: `https://www.bilinovel.com/novel/2139.html`
 4. Confirm the title, then pick the volumes to download with **↑↓ to move, Space to check** (or type a range like `1-5,8`), and press Enter.
-5. When it finishes, the files are in your **Downloads folder** (`~/Downloads`), organized by book title.
+5. The book is **added to a background download queue** and the window returns to the start immediately — you can **paste the next one to queue it too**. Finished files land in your **Downloads folder** (`~/Downloads`), organized by book title.
 
-After one book finishes, the window returns to the start so you can paste the next one; type `q` to quit.
+No need to wait for one book to finish before starting another: pick volumes, return to the start, keep adding — the queue downloads them in order (FIFO). Type `q` to quit (if the queue isn't done, it asks whether to wait or exit).
 
 > Requires **Python 3.9+**. If double-click does nothing, see "Double-click won't open" below.
 
@@ -37,10 +37,17 @@ Each step is guided, with a hint line below it:
 - **Select volumes**:
   - Option 1 — **cursor checkboxes**: ↑↓ to move, Space to toggle, Enter to confirm.
   - Option 2 — **type a range**: e.g. `1-9,15,20-25` (comma-separated, `a-b` for a run); Enter alone selects all.
-- **Choose format** (manga only): EPUB or PDF; novels are always EPUB.
+- **Choose format** (manga only): EPUB or PDF; novels are always EPUB. Then pick **where to save**: local / Baidu Netdisk / OneDrive.
 - Type `b` at any step to **go back**.
 
-At the start prompt, `s` opens **settings** and `q` quits.
+At the start prompt: `s` settings, `c` connect Baidu Netdisk, `o` connect OneDrive, `p` view the download queue, `q` quit.
+
+## Cloud upload (optional)
+
+Downloads can go to your own cloud instead of local disk; the top of the start screen shows connection status.
+
+- **Baidu Netdisk** — type `c`, a browser opens to log in; the script reuses that session. Then pick "☁ Baidu" when downloading. (Unofficial cookie-based API — against Baidu's ToS and may break; credentials stay local.)
+- **OneDrive** — type `o`, log in with the official Microsoft **device-code** flow (**zero registration** — just sign in to your own Microsoft account and consent). Uploads to your own `OneDrive/bilidownloader/manga|novel/title/`. See **[docs/onedrive.md](docs/onedrive.md)**. Company/school accounts may be blocked by an admin policy — use a personal Microsoft account.
 
 ## Settings
 
@@ -48,14 +55,17 @@ Type `s` at the start prompt. Press Enter to keep a value, or type a new one; ch
 
 - **Output directory**: defaults to your Downloads folder (`~/Downloads`); change it to any directory.
 - **Default format**: EPUB or PDF (manga only).
+- **Concurrency**: start and max thread counts (manga uses adaptive concurrency between them).
 - **Proxy**: auto by default (follows system env vars, falls back to direct if unreachable); or set `http://127.0.0.1:7890` to force a proxy.
-- **Rate limit / retry / resume**: defaults are fine for most cases; with resume on, re-downloading a book skips files already fetched.
-- **Debug logging**: turn on to write detailed logs to `logs/` when troubleshooting.
+- **Rate limit / retry / resume**: defaults are fine; with resume on, re-downloading skips volumes already saved/uploaded (see "duplicate skip" below).
+- **Baidu Netdisk / OneDrive**: upload root path, disconnect, and (OneDrive) an optional custom `client_id`.
+- **Debug logging**: writes detailed logs to `logs/`; with `--debug` it also writes a `log.txt` into the download directory.
 
 ## How downloads work
 
 - Both manga and novels **connect directly by default** — fast and light on memory. Only when a site occasionally shows a human check does it **auto-launch your local Chrome / Edge** to clear it once, then reuse it. Having **Chrome or Edge** installed as a fallback is recommended, but usually unused.
 - The download thread count auto-tunes to your network; if the site rate-limits, it slows down and recovers automatically to avoid missing pages.
+- **Duplicate files are skipped**: before downloading each volume, it checks whether the **target location** (local / your Baidu / your OneDrive) already has that volume (matched by `title - volume.epub|pdf`). If so it **skips the whole volume** — no re-download, no overwrite. To update a volume, **delete that file first**; to force a full re-download, turn off resume in settings.
 
 ## Command-line usage (advanced)
 
@@ -83,10 +93,17 @@ python3 start.py --debug                      # enable debug logging
 ```
 Bilimanga-Downloader/
 ├── start.py              # entry (first run auto-creates .venv, installs deps)
-├── run.command           # macOS double-click launcher
-├── run.bat               # Windows double-click launcher
-├── src/bilimanga_dl/     # source
-└── resource/             # assets
+├── run.command / run.bat # macOS / Windows double-click launchers
+├── docs/onedrive.md      # OneDrive setup guide
+├── userscript/           # 🐵 userscript version
+└── src/bilimanga_dl/
+    ├── core/             # net / rate-limit / logging / images / plugin registry
+    ├── sources/          # content sources (manga / novel)
+    ├── packagers/        # packagers (EPUB / PDF)
+    ├── storage/          # storage targets (local / Baidu / OneDrive)
+    └── ui/               # terminal UI (steps, picker, settings, download queue)
 ```
+
+> Plugin architecture: add a new site / format / cloud = one new plugin file, registered — no changes elsewhere.
 
 > For personal study and backup of public content only; please follow each site's terms.
