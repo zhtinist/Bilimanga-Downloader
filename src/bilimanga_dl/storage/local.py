@@ -31,3 +31,7 @@ class LocalStorage(Storage):
 
     def commit(self, path: Path, category: str, book_title: str) -> str:
         return str(path)  # 已在最终位置，无需搬运
+
+    def exists(self, category: str, book_title: str, filename: str) -> bool:
+        f = self.out_root / safe_name(book_title) / filename
+        return f.exists() and f.stat().st_size > 0

@@ -48,10 +48,31 @@ class Callbacks:
     """下载进度回调集合（均可选，首参为卷号 vidx），编排/UI 层传入。"""
 
     def __init__(self, on_start=None, on_total=None, on_image=None,
-                 on_phase=None, on_done=None, on_concurrency=None):
+                 on_phase=None, on_done=None, on_concurrency=None, on_skip=None):
         self.on_start: Optional[Callable] = on_start
         self.on_total: Optional[Callable] = on_total
         self.on_image: Optional[Callable] = on_image
         self.on_phase: Optional[Callable] = on_phase
         self.on_done: Optional[Callable] = on_done
         self.on_concurrency: Optional[Callable] = on_concurrency
+        #: 某卷因已存在被跳过：on_skip(vidx, filename)
+        self.on_skip: Optional[Callable] = on_skip
+
+
+def split_existing(book, volumes, fmt, category, storage, enabled=True):
+    """按“成品是否已存在于该存储”把卷分成 (待下载, 已存在跳过)。
+
+    ``enabled`` 关闭（如设置里关了断点续传/跳过）时不跳过，全部重下。
+    """
+    from ..downloader import output_filename
+    if not enabled or not hasattr(storage, "exists"):
+        return list(volumes), []
+    todo, skip = [], []
+    for v in volumes:
+        fname = output_filename(book, v, fmt)
+        try:
+            hit = storage.exists(category, book.title, fname)
+        except Exception:  # noqa: BLE001
+            hit = False
+        (skip if hit else todo).append((v, fname))
+    return [v for v, _ in todo], skip

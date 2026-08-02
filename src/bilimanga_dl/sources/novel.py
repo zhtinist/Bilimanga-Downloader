@@ -71,10 +71,22 @@ class NovelSource(Source):
 
     def download(self, book: Book, volumes: List[Volume], fmt: str,
                  storage, callbacks: Optional[Callbacks] = None) -> List[str]:
+        from .base import split_existing
         cb = callbacks or Callbacks()
         out_dir = storage.stage_dir("小说", book.title)
         engine = self.engine or self._ensure_mobile()
         locations: List[str] = []
+
+        # 冲突处理：成品已存在于该存储的卷直接跳过（不重下、不覆盖）。
+        todo, skipped = split_existing(
+            book, volumes, fmt, "小说", storage,
+            enabled=getattr(self.config, "resume_enabled", True))
+        for v, fname in skipped:
+            if cb.on_skip:
+                cb.on_skip(v.index, fname)
+        if not todo:
+            return locations
+        volumes = todo
 
         def on_done(vidx, path):
             if path:

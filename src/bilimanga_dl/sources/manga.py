@@ -50,12 +50,23 @@ class MangaSource(Source):
     def download(self, book: Book, volumes: List[Volume], fmt: str,
                  storage, callbacks: Optional[Callbacks] = None) -> List[str]:
         from ..downloader import Downloader
+        from .base import split_existing
         cb = callbacks or Callbacks()
         pkg_cls = packagers.find(lambda c: getattr(c, "fmt", None) == fmt) \
             or packagers.find(lambda c: getattr(c, "fmt", None) == "epub")
         packager = pkg_cls()
         out_dir = storage.stage_dir("漫画", book.title)
         locations: List[str] = []
+
+        # 冲突处理：成品已存在于该存储的卷直接跳过（不重下、不覆盖）；关掉断点续传则不跳过。
+        todo, skipped = split_existing(
+            book, volumes, fmt, "漫画", storage,
+            enabled=getattr(self.config, "resume_enabled", True))
+        for v, fname in skipped:
+            if cb.on_skip:
+                cb.on_skip(v.index, fname)
+        if not todo:
+            return locations
 
         def on_done(vidx, path):
             if path:
@@ -65,7 +76,7 @@ class MangaSource(Source):
 
         downloader = Downloader(self.net, self._scraper, self.config)
         downloader.run_pipeline(
-            book, volumes, TEMP_DOWNLOAD_DIR, out_dir, packager.build,
+            book, todo, TEMP_DOWNLOAD_DIR, out_dir, packager.build,
             on_start=cb.on_start, on_total=cb.on_total, on_image=cb.on_image,
             on_phase=cb.on_phase, on_done=on_done, on_concurrency=cb.on_concurrency)
         return locations

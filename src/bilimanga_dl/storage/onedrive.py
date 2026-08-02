@@ -99,6 +99,16 @@ class OneDriveClient:
         clean = "/".join(seg for seg in remote_path.split("/") if seg)
         return urllib.parse.quote(clean, safe="/")
 
+    def exists(self, remote_path: str) -> bool:
+        """远端是否已有该文件（GET 元数据，200 即存在）。"""
+        try:
+            enc = self._encode_path(remote_path)
+            r = self.session.get(f"{_GRAPH}/me/drive/root:/{enc}",
+                                 headers=self._auth_headers(), timeout=20)
+            return r.status_code == 200
+        except Exception:  # noqa: BLE001
+            return False
+
     def upload_file(self, local_path: str, remote_path: str) -> str:
         """上传本地文件到 OneDrive ``remote_path``（自动建父目录）。
 
@@ -249,9 +259,15 @@ class OneDriveStorage(Storage):
     def stage_dir(self, category: str, book_title: str) -> Path:
         return Path(tempfile.mkdtemp(prefix="od_up_"))
 
-    def commit(self, path: Path, category: str, book_title: str) -> str:
+    def _remote(self, category: str, book_title: str, filename: str) -> str:
         base = (self.config.onedrive_upload_base or "/bilidownloader").rstrip("/")
-        remote = f"{base}/{category}/{safe_name(book_title)}/{path.name}"
+        return f"{base}/{category}/{safe_name(book_title)}/{filename}"
+
+    def exists(self, category: str, book_title: str, filename: str) -> bool:
+        return self.client.exists(self._remote(category, book_title, filename))
+
+    def commit(self, path: Path, category: str, book_title: str) -> str:
+        remote = self._remote(category, book_title, path.name)
         self.client.upload_file(str(path), remote)
         # 上传成功后若 refresh_token 轮换了，写回配置。
         if self.client.refresh_token and self.client.refresh_token != self.config.onedrive_refresh_token:

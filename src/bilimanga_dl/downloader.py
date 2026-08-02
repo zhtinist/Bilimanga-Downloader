@@ -44,6 +44,15 @@ def safe_name(name: str) -> str:
     return cleaned or "untitled"
 
 
+def output_filename(book, vol, fmt: str) -> str:
+    """某卷成品的文件名，与打包器（epub/pdf）生成的一致：``书名 - 卷名.ext``。
+
+    用于下载前查“云/本地是否已存在该卷”，已存在则跳过整卷（不重下、不覆盖）。
+    """
+    ext = ".pdf" if fmt == "pdf" else ".epub"
+    return safe_name(f"{book.title} - {vol.title}") + ext
+
+
 def cleanup_book_temp(temp_dir: Path, title: str) -> None:
     """删除某本书的临时图片目录（异常/取消中断后清理，避免占盘）。"""
     import shutil

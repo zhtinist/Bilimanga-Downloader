@@ -141,9 +141,14 @@ class DownloadQueue:
             qprint(f"   {tag} [{task.title}] {titles.get(vidx, '')}"
                    f"  ({task.done_vols}/{task.total_vols})")
 
+        def on_skip(vidx, filename):
+            task.done_vols += 1
+            qprint(f"   ⏭ [{task.title}] {titles.get(vidx, '')} 已存在，跳过"
+                   f"  ({task.done_vols}/{task.total_vols})")
+
         storage = self._shared.storage(task.target)
         task.locations = src.download(book, volumes, task.fmt, storage,
-                                      Callbacks(on_done=on_done))
+                                      Callbacks(on_done=on_done, on_skip=on_skip))
         task.status = "完成"
         qprint(f"✔ 完成：{task.title}（{len(task.locations)} 个文件 → {tgt}）")
 

@@ -90,6 +90,23 @@ class BaiduClient:
         log.warning("百度校验失败：errno=%s", j.get("errno"))
         return None
 
+    def exists(self, remote_path: str) -> bool:
+        """远端是否已有该文件（列父目录匹配文件名）。"""
+        if not self.bdstoken and self.verify() is None:
+            return False
+        parent, _, name = remote_path.rpartition("/")
+        try:
+            r = self.session.get(
+                "https://pan.baidu.com/api/list",
+                params={"dir": parent or "/", "web": "1", "app_id": "250528",
+                        "channel": "chunlei", "clienttype": "0",
+                        "bdstoken": self.bdstoken}, timeout=20).json()
+            if r.get("errno") != 0:
+                return False
+            return any(it.get("server_filename") == name for it in r.get("list", []))
+        except Exception:  # noqa: BLE001
+            return False
+
     def _bduss(self) -> str:
         for part in self.cookie.split(";"):
             k, _, v = part.strip().partition("=")
@@ -234,9 +251,15 @@ class BaiduStorage(Storage):
     def stage_dir(self, category: str, book_title: str) -> Path:
         return Path(tempfile.mkdtemp(prefix="bili_up_"))
 
-    def commit(self, path: Path, category: str, book_title: str) -> str:
+    def _remote(self, category: str, book_title: str, filename: str) -> str:
         base = (self.config.baidu_upload_base or "/bilidownloader").rstrip("/")
-        remote = f"{base}/{category}/{safe_name(book_title)}/{path.name}"
+        return f"{base}/{category}/{safe_name(book_title)}/{filename}"
+
+    def exists(self, category: str, book_title: str, filename: str) -> bool:
+        return self.client.exists(self._remote(category, book_title, filename))
+
+    def commit(self, path: Path, category: str, book_title: str) -> str:
+        remote = self._remote(category, book_title, path.name)
         self.client.upload_file(str(path), remote)
         try:
             path.unlink()          # 上传成功后删临时文件

@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Bilimanga 漫画/轻小说下载器
 // @namespace    https://github.com/zhtinist/Bilimanga-Downloader
-// @version      3.1.3
+// @version      3.2.0
 // @description  在 bilimanga 漫画 / 哔哩轻小说(bilinovel) 页面里一键把整卷下载成 EPUB / PDF，可存本地或上传到你的百度网盘。
 // @author       HTZHU
 // @license      MIT
@@ -1508,6 +1508,41 @@
     return remotePath;
   }
 
+  // 云端是否已存在该成品（用于下载前跳过整卷）。本地无法检测（浏览器下载），故只查云。
+  async function baiduFileExists(remotePath) {
+    const info = await baiduVerify();
+    if (!info) return false;
+    const i = remotePath.lastIndexOf("/");
+    const parent = remotePath.slice(0, i) || "/";
+    const name = remotePath.slice(i + 1);
+    try {
+      const url = "https://pan.baidu.com/api/list?" + formBody({
+        dir: parent, web: "1", app_id: "250528", channel: "chunlei",
+        clienttype: "0", bdstoken: info.bdstoken });
+      const r = JSON.parse((await gmReq({ method: "GET", url })).responseText);
+      if (r.errno !== 0) return false;
+      return (r.list || []).some((it) => it.server_filename === name);
+    } catch (e) { return false; }
+  }
+  async function odFileExists(remotePath) {
+    const tok = await odAccessToken();
+    if (!tok) return false;
+    const enc = remotePath.split("/").filter(Boolean).map(encodeURIComponent).join("/");
+    try {
+      const r = await gmReq({ method: "GET", url: `${OD_GRAPH}/me/drive/root:/${enc}`,
+        headers: { Authorization: "Bearer " + tok } });
+      return r.status === 200;
+    } catch (e) { return false; }
+  }
+  // 云端已存在则返回 true（跳过整卷）。saveTarget=local 恒 false。
+  async function cloudHasFile(book, filename) {
+    try {
+      if (saveTarget === "baidu") return await baiduFileExists(baiduRemotePath(book, filename));
+      if (saveTarget === "onedrive") return await odFileExists(odRemotePath(book, filename));
+    } catch (e) {}
+    return false;
+  }
+
   // 统一保存出口：按面板选择存本地 / 百度 / OneDrive。
   async function dispatchSave(book, bytes, filename, ext, prog) {
     if (saveTarget === "baidu") {
@@ -1977,6 +2012,11 @@
         st.className = "st done";
         bar.style.width = "100%";
       },
+      skip: () => {
+        st.textContent = "已存在，跳过";
+        st.className = "st done";
+        bar.style.width = "100%";
+      },
       error: (t) => {
         st.textContent = t;
         st.className = "st err";
@@ -2032,6 +2072,17 @@
     try {
       for (const vol of volumes) {
         const prog = progs[vol.index];
+        // 冲突处理：存云盘时，下载前先查云端是否已有该卷；有则跳过整卷（不重下、不覆盖）。
+        const ext = book.kind === "novel" ? "epub" : fmt;
+        const filename = safeName(`${book.title} - ${vol.title}`) + "." + ext;
+        if (saveTarget !== "local") {
+          prog.setState("检查云端…");
+          if (await cloudHasFile(book, filename)) {
+            dlog("跳过（云端已存在）", filename);
+            prog.skip();
+            continue;
+          }
+        }
         try {
           if (book.kind === "novel") await processVolumeNovel(book, vol, prog);
           else await processVolume(book, vol, fmt, prog);

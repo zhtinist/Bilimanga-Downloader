@@ -38,3 +38,7 @@ class Storage(ABC):
     @abstractmethod
     def commit(self, path: Path, category: str, book_title: str) -> str:
         """一卷成品写好后调用；返回该成品的最终可读位置。"""
+
+    def exists(self, category: str, book_title: str, filename: str) -> bool:
+        """该成品是否已存在于本存储（用于下载前跳过已有卷）。默认 False（不跳过）。"""
+        return False
