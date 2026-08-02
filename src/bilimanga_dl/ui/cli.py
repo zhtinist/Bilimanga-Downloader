@@ -146,6 +146,7 @@ class _Shared:
         self._sources: dict = {}       # kind -> Source 实例（会话/引擎跨本复用）
         self._baidu: Optional[tuple] = None   # (connected, nickname) 缓存
         self._onedrive: Optional[tuple] = None  # (connected, account) 缓存
+        self._queue = None                     # 下载任务队列（惰性建）
 
     def ensure_net(self) -> Net:
         if self._net is None:
@@ -158,6 +159,13 @@ class _Shared:
             cls = _source_reg.find(lambda c: getattr(c, "kind", None) == kind)
             self._sources[kind] = cls(self.ensure_net(), self.config)
         return self._sources[kind]
+
+    def queue(self):
+        """下载任务队列（后台串行下载）。首次访问时创建并启动 worker。"""
+        if self._queue is None:
+            from .queue import DownloadQueue
+            self._queue = DownloadQueue(self.config)
+        return self._queue
 
     def storage(self, target: str = "local"):
         """按去向返回存储插件：baidu / onedrive（已连接时）或本地。"""
@@ -239,6 +247,12 @@ class _Shared:
         return False
 
     def close(self) -> None:
+        if self._queue is not None:
+            try:
+                self._queue.close()
+            except Exception:  # noqa: BLE001
+                pass
+            self._queue = None
         for s in self._sources.values():
             try:
                 s.close()
@@ -311,6 +325,24 @@ def _classify_input(raw: str, default_is_novel: bool):
 
 
 # ---------------- 各步骤 ----------------
+def _show_queue(st: _State) -> None:
+    """打印下载队列全部任务及其状态。"""
+    q = st.shared._queue
+    if q is None or not q.tasks:
+        _print("[dim]队列为空。[/dim]")
+        return
+    _print("[bold]下载队列（按加入顺序）：[/bold]")
+    icon = {"排队": "⏳", "下载中": "[cyan]▶[/cyan]", "完成": "[green]✓[/green]",
+            "失败": "[red]✖[/red]"}
+    for t in q.tasks:
+        line = f"  {icon.get(t.status, '·')} #{t.seq} {t.title}  [{t.status}]"
+        if t.status == "下载中":
+            line += f"（卷 {t.done_vols}/{t.total_vols}）"
+        elif t.status == "失败" and t.error:
+            line += f" — {t.error}"
+        _print(line)
+
+
 def _step_input(st: _State) -> str:
     """合并入口：粘贴任意网址自动识别漫画/轻小说；裸书号再快速追问类型。"""
     _clear()
@@ -328,15 +360,41 @@ def _step_input(st: _State) -> str:
         _print(f"[green]☁ OneDrive：{od_acct}[/green]")
     else:
         _print("[grey37]☁ OneDrive：未连接[/grey37]（输入 o 连接）")
-    _print("[dim]s=设置   c=连接百度云   o=连接OneDrive   q=退出[/dim]")
-    raw = _ask_text("→ 网址或书号：")
+    # 下载队列状态（后台串行下载，可边下边加）
+    if st.shared._queue is not None:
+        summary = st.shared.queue().status_summary()
+        if summary:
+            _print(f"[cyan]🧾 队列：{summary}[/cyan]（输入 p 看详情）")
+    _print("[dim]s=设置   c=连接百度云   o=连接OneDrive   p=队列   q=退出[/dim]")
+    raw = _ask_text("→ 网址或书号（可继续加下一本，后台按顺序下载）：")
     if raw is None:
         st.exit_app = True
         return QUIT
     raw = raw.strip()
     if raw.lower() in ("q", "quit", "exit"):
+        # 队列里还有没下完的任务时，确认一次（退出会中断后台下载）。
+        if st.shared._queue is not None and st.shared.queue().busy():
+            _print(f"[yellow]仍有任务在下载/排队：{st.shared.queue().status_summary()}[/yellow]")
+            ans = _ask_text("输入 w 等它们下完再退出，输入 q 立即退出，其它=取消：")
+            a = (ans or "").strip().lower()
+            if a == "w":
+                _print("[dim]等待队列下完……（Ctrl-C 可强制退出）[/dim]")
+                try:
+                    st.shared.queue().wait_all()
+                except KeyboardInterrupt:
+                    pass
+                st.exit_app = True
+                return QUIT
+            if a == "q":
+                st.exit_app = True
+                return QUIT
+            return GO_BACK
         st.exit_app = True
         return QUIT
+    if raw.lower() in ("p", "队列", "queue"):
+        _show_queue(st)
+        _pause("\n按回车返回……")
+        return GO_BACK
     if raw.lower() in ("s", "设置", "setting", "settings"):
         open_settings(st.config, use_terminal=True)
         _pause("\n按回车返回……")
@@ -471,24 +529,16 @@ def _step_download(st: _State) -> str:
         if choice.startswith("←"):
             return GO_BACK
         target = next((t for lbl, t in options if lbl == choice), "local")
-    storage = st.shared.storage(target)
-    _print(f"保存去向：[bold]{storage.status_label()}[/bold]\n")
-    index_map = {v.index: v for v in st.book.volumes}
-    volumes = [index_map[i] for i in st.selected if i in index_map]
-    try:
-        locations = _download_with_progress(st.source, st.book, volumes, st.fmt, storage)
-    except KeyboardInterrupt:
-        _print("\n[yellow]已中断，清理临时文件…[/yellow]")
-        cleanup_book_temp(TEMP_DOWNLOAD_DIR, st.book.title)
-        _pause("按回车返回主菜单……")
-        return QUIT
-    except Exception as exc:  # noqa: BLE001
-        _print(f"\n[red]下载出错：{exc}[/red]")
-        cleanup_book_temp(TEMP_DOWNLOAD_DIR, st.book.title)
-        _pause("按回车返回主菜单……")
-        return QUIT
-    _print(f"\n[bold green]✓ 全部完成，共 {len(locations)} 个文件（{storage.status_label()}）[/bold green]")
-    _pause("\n按回车返回主菜单……")
+    tgt_label = st.shared.storage(target).status_label()
+    # 加入下载队列，立刻回主界面（后台 worker 按加入顺序逐本下载，可继续加任务）。
+    q = st.shared.queue()
+    task = q.add(st.is_novel, st.book_no, st.book.title, st.selected, st.fmt, target)
+    _print(f"\n[bold green]✓ 已加入下载队列（第 {task.seq} 个）[/bold green]："
+           f"{st.book.title}（{len(st.selected)} 卷 → {tgt_label}）")
+    pend = q.pending_count()
+    _print("[dim]后台开始下载；可回主界面继续添加下一本。"
+           + (f"当前排队 {pend} 本。" if pend > 1 else "") + "[/dim]")
+    _pause("\n按回车回主界面……")
     return QUIT
 
 
@@ -583,6 +633,13 @@ def run_download(config: Config, url_or_no: str) -> None:
         return
     try:
         _run_flow(st, start_at=1)   # 从“确认”开始
+        # 参数模式：任务进了队列，需等它下完再退出（否则后台 worker 随进程退出被杀）。
+        if shared._queue is not None and shared.queue().busy():
+            _print("[dim]下载中……（Ctrl-C 取消）[/dim]")
+            try:
+                shared.queue().wait_all()
+            except KeyboardInterrupt:
+                _print("\n[yellow]已取消。[/yellow]")
     finally:
         shared.close()
 
