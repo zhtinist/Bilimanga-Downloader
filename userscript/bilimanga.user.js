@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Bilimanga 漫画/轻小说下载器
 // @namespace    https://github.com/zhtinist/Bilimanga-Downloader
-// @version      3.1.2
+// @version      3.1.3
 // @description  在 bilimanga 漫画 / 哔哩轻小说(bilinovel) 页面里一键把整卷下载成 EPUB / PDF，可存本地或上传到你的百度网盘。
 // @author       HTZHU
 // @license      MIT
@@ -107,12 +107,14 @@
 
   // 给任意 Promise 套一个总超时兜底：无论卡在网络、图片解码还是 canvas 编码，
   // 到点就 reject，保证并发池的 worker 一定会往下走，绝不永久卡住。
+  // 超时用 sleep()（走 Web Worker 定时）而非页面 setTimeout——后台标签页里页面 setTimeout
+  // 会被节流/冻结，导致超时判断严重滞后（日志里就出现过 40s 守卫拖到 159s 才触发）。
   function withTimeout(promise, ms, label) {
-    let t;
-    const guard = new Promise((_, rej) => {
-      t = setTimeout(() => rej(new Error((label || "操作") + "超时")), ms);
+    let settled = false;
+    const guard = sleep(ms).then(() => {
+      if (!settled) throw new Error((label || "操作") + "超时");
     });
-    return Promise.race([promise, guard]).finally(() => clearTimeout(t));
+    return Promise.race([promise, guard]).finally(() => { settled = true; });
   }
 
   // ===================== 调试日志 =====================
