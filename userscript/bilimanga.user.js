@@ -1975,12 +1975,16 @@
 
     const book = currentBook;
     const volumes = book.volumes.filter((v) => selected.includes(v.index));
-    // 合并视图：清掉选卷 UI，卷列表变成只含选中卷的进度行。
+    // 合并视图：收起选择控件，卷列表就地换成“选中的这些卷”的进度行。
     enterDownloadMode();
+    // 先把所有选中卷的进度行一次性建好（都在，初始“等待中”），逐本下载时更新各自那行——
+    // 保留 3-7 全部行，而不是只显示正在下的那一行。
+    const progs = {};
+    for (const vol of volumes) progs[vol.index] = createProgress(`${vol.index}. ${vol.title}`);
     downloading = true;
     try {
       for (const vol of volumes) {
-        const prog = createProgress(`${vol.index}. ${vol.title}`);
+        const prog = progs[vol.index];
         try {
           if (book.kind === "novel") await processVolumeNovel(book, vol, prog);
           else await processVolume(book, vol, fmt, prog);
