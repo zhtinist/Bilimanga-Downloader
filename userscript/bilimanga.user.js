@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Bilimanga 漫画/轻小说下载器
 // @namespace    https://github.com/zhtinist/Bilimanga-Downloader
-// @version      3.1.0
+// @version      3.1.1
 // @description  在 bilimanga 漫画 / 哔哩轻小说(bilinovel) 页面里一键把整卷下载成 EPUB / PDF，可存本地或上传到你的百度网盘。
 // @author       HTZHU
 // @license      MIT
@@ -1647,6 +1647,7 @@
       box-shadow:0 10px 40px rgba(0,0,0,.25);padding:16px;
       font-family:-apple-system,"PingFang SC","Microsoft YaHei",sans-serif;font-size:14px;line-height:1.6;}
     #bmd-panel.bmd-hidden{display:none;}
+    .bmd-hidden{display:none !important;}
     #bmd-panel h3{margin:0 0 10px;font-size:16px;}
     #bmd-panel .bmd-close{position:absolute;right:12px;top:10px;cursor:pointer;color:#888;border:none;background:none;font-size:18px;}
     #bmd-panel input[type=text]{width:100%;padding:8px 10px;border:1px solid #e3e6ea;border-radius:8px;box-sizing:border-box;}
@@ -1685,37 +1686,37 @@
     panel.className = "bmd-hidden";
     panel.innerHTML = `
       <button class="bmd-close" title="关闭">×</button>
-      <h3>下载本书</h3>
+      <h3 id="bmd-title">下载本书</h3>
       <div id="bmd-meta">正在读取本书目录…</div>
-      <div class="bmd-row">
+      <div class="bmd-row bmd-sel">
         <button class="bmd-btn" id="bmd-all">全选</button>
         <button class="bmd-btn" id="bmd-none">清空</button>
         <input type="text" id="bmd-expr" placeholder="表达式 1-9,15,20-25" />
         <button class="bmd-btn" id="bmd-apply">应用</button>
       </div>
       <div id="bmd-list"></div>
-      <div class="bmd-row">
+      <div class="bmd-row bmd-sel">
         <label><input type="radio" name="bmd-fmt" value="epub" checked> EPUB</label>
         <label><input type="radio" name="bmd-fmt" value="pdf"> PDF</label>
         <button class="bmd-btn primary" id="bmd-start" style="margin-left:auto">开始下载</button>
       </div>
-      <div class="bmd-row">
+      <div class="bmd-row bmd-sel">
         <span style="color:#888">保存到：</span>
         <label><input type="radio" name="bmd-dest" value="local" checked> 💾 本地</label>
         <label><input type="radio" name="bmd-dest" value="baidu"> ☁ 百度网盘</label>
         <label><input type="radio" name="bmd-dest" value="onedrive"> ☁ OneDrive</label>
       </div>
-      <div class="bmd-row bmd-hidden" id="bmd-baidu-row">
+      <div class="bmd-row bmd-sel bmd-hidden" id="bmd-baidu-row">
         <span id="bmd-baidu-status" style="font-size:12px;color:#888"></span>
         <span style="color:#888;white-space:nowrap">网盘根路径</span>
         <input type="text" id="bmd-baidu-base" placeholder="/bilidownloader" style="flex:1;min-width:100px" />
       </div>
-      <div class="bmd-row bmd-hidden" id="bmd-od-row">
+      <div class="bmd-row bmd-sel bmd-hidden" id="bmd-od-row">
         <span id="bmd-od-status" style="font-size:12px;color:#888">检测登录…</span>
         <button class="bmd-btn" id="bmd-od-connect">连接 OneDrive</button>
         <a href="${OD_DOC_URL}" target="_blank" style="font-size:12px">配置教程</a>
       </div>
-      <div class="bmd-row bmd-hidden" id="bmd-od-cfg">
+      <div class="bmd-row bmd-sel bmd-hidden" id="bmd-od-cfg">
         <span style="color:#888;white-space:nowrap">根路径</span>
         <input type="text" id="bmd-od-base" placeholder="/bilidownloader" style="flex:1;min-width:100px" />
       </div>
@@ -1723,7 +1724,7 @@
         <label title="勾选后开始记录每次请求/每章/每张图，卡住时也能定位">
           <input type="checkbox" id="bmd-debug"> 🐞 调试日志
         </label>
-        <button class="bmd-btn" id="bmd-savelog" style="margin-left:auto" title="把当前日志下载成 log.txt 到浏览器下载目录">⬇ 下载日志</button>
+        <button class="bmd-btn bmd-hidden" id="bmd-savelog" style="margin-left:auto" title="把当前日志下载成 log.txt 到浏览器下载目录">⬇ 下载日志</button>
       </div>
       <div id="bmd-hint"></div>
       <div id="bmd-progress"></div>
@@ -1767,9 +1768,12 @@
         btn.disabled = false;
       }
     });
-    // 调试日志：勾选即开始记录；「下载日志」按钮随时把 log.txt 下到浏览器下载目录。
+    // 调试日志：勾选后才显示「下载日志」按钮（分层弹出）；勾选即开始记录。调试行不随
+    // 选卷控件收起（下载中/后仍可随时点「下载日志」）。
     panel.querySelector("#bmd-debug").addEventListener("change", (e) => {
-      if (e.target.checked) {
+      const show = e.target.checked;
+      panel.querySelector("#bmd-savelog").classList.toggle("bmd-hidden", !show);
+      if (show) {
         startDebugCapture();
         setHint("调试日志已开启，开始记录；下载卡住时点「⬇ 下载日志」把 log.txt 发我。");
       } else {
@@ -1888,13 +1892,35 @@
     }
   }
 
+  // 下载视图状态：合并选卷/进度界面。进入下载：收起 .bmd-sel 控件、卷列表清空改放进度行。
+  let inDownloadView = false;
+  let downloading = false;
+
+  function enterDownloadMode() {
+    inDownloadView = true;
+    panel.querySelectorAll(".bmd-sel").forEach((el) => el.classList.add("bmd-hidden"));
+    panel.querySelector("#bmd-title").textContent = "下载中";
+    panel.querySelector("#bmd-list").innerHTML = "";     // 清空选卷，进度行放这里
+    panel.querySelector("#bmd-progress").innerHTML = "";
+  }
+
+  function restoreSelectMode() {
+    inDownloadView = false;
+    panel.querySelector("#bmd-title").textContent = "下载本书";
+    panel.querySelector("#bmd-progress").innerHTML = "";
+    panel.querySelectorAll(".bmd-sel").forEach((el) => el.classList.remove("bmd-hidden"));
+    if (currentBook) renderBook(currentBook);            // 重建选卷列表
+    onDestChange();                                      // 恢复网盘行显隐
+  }
+
   function createProgress(title) {
     const el = document.createElement("div");
     el.className = "bmd-prog";
     el.innerHTML =
       `<div class="ph"><span>${escHtml(title)}</span><span class="st">等待中</span></div>` +
       `<div class="bmd-bar"><i></i></div>`;
-    panel.querySelector("#bmd-progress").appendChild(el);
+    // 合并视图：进度行就放在原选卷列表区域（#bmd-list）。
+    panel.querySelector("#bmd-list").appendChild(el);
     const st = el.querySelector(".st");
     const bar = el.querySelector(".bmd-bar > i");
     return {
@@ -1946,11 +1972,12 @@
       dlog("书", currentBook.title, currentBook.kind, "选中卷", selected.join(","), "格式=" + fmt, "去向=" + saveTarget);
     }
     setHint(DBG ? "调试记录中：下载卡住时点「⬇ 下载日志」把 log.txt 发我。" : "");
-    panel.querySelector("#bmd-start").disabled = true;
-    panel.querySelector("#bmd-progress").innerHTML = "";
 
     const book = currentBook;
     const volumes = book.volumes.filter((v) => selected.includes(v.index));
+    // 合并视图：清掉选卷 UI，卷列表变成只含选中卷的进度行。
+    enterDownloadMode();
+    downloading = true;
     try {
       for (const vol of volumes) {
         const prog = createProgress(`${vol.index}. ${vol.title}`);
@@ -1967,10 +1994,13 @@
         }
       }
     } finally {
-      panel.querySelector("#bmd-start").disabled = false;
+      downloading = false;
+      panel.querySelector("#bmd-title").textContent = "下载完成";
       if (DBG) {
         dlog("=== 本次下载结束 ===");
-        setHint("下载结束。若刚才卡住或有问题，点「⬇ 下载日志」把 log.txt 发我。");
+        setHint("下载结束。若刚才卡住或有问题，点「⬇ 下载日志」把 log.txt 发我。再下一本：重开面板即可。");
+      } else {
+        setHint("下载完成。要再下一本 / 换选卷：点右上角 × 关闭，再点「⬇ 下载本书」重新打开即可。");
       }
     }
   }
@@ -1979,7 +2009,10 @@
     if (!panel) buildPanel();
     const visible = show === undefined ? panel.classList.contains("bmd-hidden") : show;
     panel.classList.toggle("bmd-hidden", !visible);
-    if (visible && !currentBook) loadCurrentBook(); // 首次展开：直接加载当前这本书
+    if (visible) {
+      if (!currentBook) loadCurrentBook();            // 首次展开：加载当前这本书
+      else if (inDownloadView && !downloading) restoreSelectMode(); // 下完再打开：回到选卷
+    }
   }
 
   // 从当前 URL 提取书号，并判断是漫画还是轻小说。
